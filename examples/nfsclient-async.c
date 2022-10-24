@@ -37,8 +37,16 @@ WSADATA wsaData;
 #include <unistd.h>
 #endif
 
-// Used for profiling the code
+// Time instrumentation used for profiling the code
 #include <time.h>
+
+struct timespec time_start, time_end;
+double time_diff;
+
+void set_time_diff(struct timespec* time_start_pointer, struct timespec* time_end_pointer, double* time_diff_pointer) {
+	*time_diff_pointer = (time_end_pointer->tv_sec - time_start_pointer->tv_sec) 
+		+ 1e-9 * (time_end_pointer->tv_nsec - time_start_pointer->tv_nsec);
+}
 
 
 // Input parameters for client; configure these as needed
@@ -46,7 +54,8 @@ WSADATA wsaData;
 #define EXPORT "/mnt/myshareddir" // exported directory of NFS server
 #define NFSFILE "/books/classics/dracula.txt" // path within exported directory to file to read
 #define NFSDIR "/books/classics/" // containing directory of NFSFILE
-#define BYTES_READ 256
+#define BYTES_READ (1024 * 1024 * 512)
+#define BYTES_WRITE 256
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -154,6 +163,38 @@ void nfs_fstat64_cb(int status, struct nfs_context *nfs, void *data, void *priva
 
 void nfs_read_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
+	// get callback for completion of function
+	clock_gettime(CLOCK_MONOTONIC, &time_end);
+	set_time_diff(&time_start, &time_end, &time_diff);
+
+	struct client *client = private_data;
+	char *read_data;
+	int i;
+
+	if (status < 0) {
+		printf("read failed with \"%s\"\n", (char *)data);
+		exit(10);
+	}
+
+	printf("read successful with %d bytes of data\n", status);
+	printf("Time of read was: %f seconds\n", time_diff);
+
+	int BYTES_READ_DISPLAY = 16;
+	read_data = data;
+	printf("Displaying %d bytes of data\n", BYTES_READ_DISPLAY);
+	for (i=0; i < BYTES_READ_DISPLAY; i++) {
+		printf("%02x ", read_data[i]&0xff);
+	}
+	printf("\n");
+	printf("Fstat file :%s\n", NFSFILE);
+	if (nfs_fstat64_async(nfs, client->nfsfh, nfs_fstat64_cb, client) != 0) {
+		printf("Failed to start async nfs fstat\n");
+		exit(10);
+	}
+}
+
+void nfs_write_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+{
 	struct client *client = private_data;
 	char *read_data;
 	int i;
@@ -189,7 +230,10 @@ void nfs_open_cb(int status, struct nfs_context *nfs, void *data, void *private_
 	nfsfh         = data;
 	client->nfsfh = nfsfh;
 	printf("Got reply from server for open(%s). Handle:%p\n", NFSFILE, data);
-	printf("Read first %f bytes\n", BYTES_READ);
+	printf("Read first %d bytes\n", BYTES_READ);
+
+	// begin measurement
+	clock_gettime(CLOCK_MONOTONIC, &time_start);
 	if (nfs_pread_async(nfs, nfsfh, 0, BYTES_READ, nfs_read_cb, client) != 0) {
 		printf("Failed to start async nfs open\n");
 		exit(10);
