@@ -48,6 +48,10 @@ void set_time_diff(struct timespec* time_start_pointer, struct timespec* time_en
 		+ 1e-9 * (time_end_pointer->tv_nsec - time_start_pointer->tv_nsec);
 }
 
+// Character buffer for writing to NFS File
+#include <string.h>
+char* char_buf = NULL;
+
 
 // Input parameters for client; configure these as needed
 #define SERVER "172.30.8.6" // ip address of NFS server
@@ -55,7 +59,7 @@ void set_time_diff(struct timespec* time_start_pointer, struct timespec* time_en
 #define NFSFILE "/books/classics/dracula.txt" // path within exported directory to file to read
 #define NFSDIR "/books/classics/" // containing directory of NFSFILE
 #define BYTES_READ (1024 * 1024 * 512)
-#define BYTES_WRITE 256
+#define BYTES_WRITE (1024 * 1024 * 512)
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -195,6 +199,10 @@ void nfs_read_cb(int status, struct nfs_context *nfs, void *data, void *private_
 
 void nfs_write_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
+	// get callback for completion of function
+	clock_gettime(CLOCK_MONOTONIC, &time_end);
+	set_time_diff(&time_start, &time_end, &time_diff);
+
 	struct client *client = private_data;
 	char *read_data;
 	int i;
@@ -204,11 +212,9 @@ void nfs_write_cb(int status, struct nfs_context *nfs, void *data, void *private
 		exit(10);
 	}
 
-	printf("read successful with %d bytes of data\n", status);
-	read_data = data;
-	for (i=0; i < BYTES_READ; i++) {
-		printf("%02x ", read_data[i]&0xff);
-	}
+	printf("write successful with %d bytes of data\n", status);
+	printf("Time of write was: %f seconds\n", time_diff);
+
 	printf("\n");
 	printf("Fstat file :%s\n", NFSFILE);
 	if (nfs_fstat64_async(nfs, client->nfsfh, nfs_fstat64_cb, client) != 0) {
@@ -240,6 +246,35 @@ void nfs_open_cb(int status, struct nfs_context *nfs, void *data, void *private_
 	}
 }
 
+void nfs_open_cb_write(int status, struct nfs_context *nfs, void *data, void *private_data)
+{
+	struct client *client = private_data;
+	struct nfsfh *nfsfh;
+
+	if (status < 0) {
+		printf("open call failed with \"%s\"\n", (char *)data);
+		exit(10);
+	}
+
+	nfsfh         = data;
+	client->nfsfh = nfsfh;
+	printf("Got reply from server for open(%s). Handle:%p\n", NFSFILE, data);
+
+	// Allocate and initialize character buffer
+	char_buf = (char *)malloc(BYTES_WRITE);
+	assert(char_buf != NULL);
+	memset(char_buf, 'c', BYTES_WRITE);
+
+	printf("Write first %d bytes\n", BYTES_WRITE);
+
+	// begin measurement
+	clock_gettime(CLOCK_MONOTONIC, &time_start);
+	if (nfs_pwrite_async(nfs, nfsfh, 0, BYTES_WRITE, char_buf, nfs_write_cb, client) != 0) {
+		printf("Failed to start async nfs open\n");
+		exit(10);
+	}
+}
+
 void nfs_stat64_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct client *client = private_data;
@@ -257,7 +292,7 @@ void nfs_stat64_cb(int status, struct nfs_context *nfs, void *data, void *privat
 	printf("Inode %04o\n", (int)st->nfs_ino);
 
 	printf("Open file for reading :%s\n", NFSFILE);
-	if (nfs_open_async(nfs, NFSFILE, O_RDONLY, nfs_open_cb, client) != 0) {
+	if (nfs_open_async(nfs, NFSFILE, O_RDONLY, nfs_open_cb_write, client) != 0) {
 		printf("Failed to start async nfs open\n");
 		exit(10);
 	}
