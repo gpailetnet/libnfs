@@ -118,6 +118,7 @@ void nfs_opendir_cb(int status, struct nfs_context *nfs, void *data, void *priva
 	}
 	nfs_closedir(nfs, nfsdir);
 
+	printf("\nCalling getexports:\n");
 	mount_context = rpc_init_context();
 	if (mount_getexports_async(mount_context, client->server, mount_export_cb, client) != 0) {
 		printf("Failed to start MOUNT/EXPORT\n");
@@ -135,6 +136,7 @@ void nfs_close_cb(int status, struct nfs_context *nfs, void *data, void *private
 	}
 
 	printf("close successful\n");
+	printf("\n");
 	printf("call opendir(%s)\n", NFSDIR);
 	if (nfs_opendir_async(nfs, NFSDIR, nfs_opendir_cb, client) != 0) {
 		printf("Failed to start async nfs close\n");
@@ -157,6 +159,7 @@ void nfs_fstat64_cb(int status, struct nfs_context *nfs, void *data, void *priva
 	printf("Mode %04o\n", (int)st->nfs_mode);
 	printf("Size %d\n", (int)st->nfs_size);
 	printf("Inode %04o\n", (int)st->nfs_ino);
+	printf("\n");
 
 	printf("Close file\n");
 	if (nfs_close_async(nfs, client->nfsfh, nfs_close_cb, client) != 0) {
@@ -203,6 +206,9 @@ void nfs_write_cb(int status, struct nfs_context *nfs, void *data, void *private
 	clock_gettime(CLOCK_MONOTONIC, &time_end);
 	set_time_diff(&time_start, &time_end, &time_diff);
 
+	// free char_buf
+	free(char_buf);
+
 	struct client *client = private_data;
 	char *read_data;
 	int i;
@@ -236,7 +242,7 @@ void nfs_open_cb(int status, struct nfs_context *nfs, void *data, void *private_
 	nfsfh         = data;
 	client->nfsfh = nfsfh;
 	printf("Got reply from server for open(%s). Handle:%p\n", NFSFILE, data);
-	printf("Read first %d bytes\n", BYTES_READ);
+	printf("\nReading first %d bytes\n", BYTES_READ);
 
 	// begin measurement
 	clock_gettime(CLOCK_MONOTONIC, &time_start);
@@ -265,7 +271,7 @@ void nfs_open_cb_write(int status, struct nfs_context *nfs, void *data, void *pr
 	assert(char_buf != NULL);
 	memset(char_buf, 'c', BYTES_WRITE);
 
-	printf("Write first %d bytes\n", BYTES_WRITE);
+	printf("\nWriting first %d bytes\n", BYTES_WRITE);
 
 	// begin measurement
 	clock_gettime(CLOCK_MONOTONIC, &time_start);
@@ -290,6 +296,7 @@ void nfs_stat64_cb(int status, struct nfs_context *nfs, void *data, void *privat
 	printf("Mode %04o\n", (unsigned int) st->nfs_mode);
 	printf("Size %d\n", (int)st->nfs_size);
 	printf("Inode %04o\n", (int)st->nfs_ino);
+	printf("\n");
 
 	printf("Open file for reading :%s\n", NFSFILE);
 	if (nfs_open_async(nfs, NFSFILE, O_RDONLY, nfs_open_cb_write, client) != 0) {
@@ -307,7 +314,7 @@ void nfs_mount_cb(int status, struct nfs_context *nfs, void *data, void *private
 		exit(10);
 	}
 
-	printf("Got reply from server for MOUNT/MNT procedure.\n");
+	printf("Got reply from server for MOUNT/MNT procedure.\n\n");
 	printf("Stat file :%s\n", NFSFILE);
 	if (nfs_stat64_async(nfs, NFSFILE, nfs_stat64_cb, client) != 0) {
 		printf("Failed to start async nfs stat\n");
