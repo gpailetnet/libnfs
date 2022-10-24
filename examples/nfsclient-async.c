@@ -37,10 +37,16 @@ WSADATA wsaData;
 #include <unistd.h>
 #endif
 
-#define SERVER "10.1.1.27"
-#define EXPORT "/VIRTUAL"
-#define NFSFILE "/BOOKS/Classics/Dracula.djvu"
-#define NFSDIR "/BOOKS/Classics/"
+// Used for profiling the code
+#include <time.h>
+
+
+// Input parameters for client; configure these as needed
+#define SERVER "172.30.8.6" // ip address of NFS server
+#define EXPORT "/mnt/myshareddir" // exported directory of NFS server
+#define NFSFILE "/books/classics/dracula.txt" // path within exported directory to file to read
+#define NFSDIR "/books/classics/" // containing directory of NFSFILE
+#define BYTES_READ 256
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -159,7 +165,7 @@ void nfs_read_cb(int status, struct nfs_context *nfs, void *data, void *private_
 
 	printf("read successful with %d bytes of data\n", status);
 	read_data = data;
-	for (i=0;i<16;i++) {
+	for (i=0; i < BYTES_READ; i++) {
 		printf("%02x ", read_data[i]&0xff);
 	}
 	printf("\n");
@@ -183,8 +189,8 @@ void nfs_open_cb(int status, struct nfs_context *nfs, void *data, void *private_
 	nfsfh         = data;
 	client->nfsfh = nfsfh;
 	printf("Got reply from server for open(%s). Handle:%p\n", NFSFILE, data);
-	printf("Read first 64 bytes\n");
-	if (nfs_pread_async(nfs, nfsfh, 0, 64, nfs_read_cb, client) != 0) {
+	printf("Read first %f bytes\n", BYTES_READ);
+	if (nfs_pread_async(nfs, nfsfh, 0, BYTES_READ, nfs_read_cb, client) != 0) {
 		printf("Failed to start async nfs open\n");
 		exit(10);
 	}
