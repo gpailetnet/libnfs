@@ -59,7 +59,8 @@ char* char_buf = NULL;
 #define NFSFILE "/books/classics/dracula.txt" // path within exported directory to file to read
 #define NFSDIR "/books/classics/" // containing directory of NFSFILE
 #define BYTES_READ (1024 * 1024 * 512)
-#define BYTES_WRITE (1024 * 1024 * 512)
+#define BYTES_WRITE (10)
+#define WRITE_CHAR 'f'
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -79,6 +80,81 @@ struct client {
        struct nfsfh *nfsfh;
        int is_finished;
 };
+
+/**
+ * Used to keep track of completed writes for pwrite async batch
+*/
+struct batch_pwrite_cb_data {
+	void* private_data;
+	nfs_cb batch_cb;
+	uint64_t completed_pwrites;
+	uint64_t num_pwrites;
+};
+
+/**
+ * The callback for a single pwrite within a batch operation.  Increments the total count of 
+ * completed writes within the batch
+*/
+void nfs_batch_single_pwrite_cb(int status, struct nfs_context *nfs, void *data, void *private_data);
+
+int initialize_batch_pwrite_cb_data_ptr(struct nfs_context *nfs, 
+	struct batch_pwrite_cb_data **data_ptr, void *private_data, 
+	uint64_t num_pwrites, nfs_cb cb) 
+{
+	*data_ptr = (struct batch_pwrite_cb_data*) malloc(sizeof(**data_ptr));
+	if (*data_ptr == NULL) {
+			nfs_set_error(nfs, "Out of memory. Failed to allocate "
+							"cb data");
+			return -1;
+	}
+	memset(*data_ptr, 0, sizeof(**data_ptr));
+
+	(*data_ptr)->private_data = private_data;
+	(*data_ptr)->completed_pwrites = 0;
+	(*data_ptr)->num_pwrites = num_pwrites;
+	(*data_ptr)->batch_cb = cb;
+	return 0;
+}
+
+// void nfs_pwrite_async_batch_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+// {
+// 	printf("Callback called");
+// 	// struct client *client = private_data;
+
+// 	// if (status < 0) {
+// 	// 	printf("close failed with \"%s\"\n", (char *)data);
+// 	// 	exit(10);
+// 	// }
+
+// 	// printf("close successful\n");
+// 	// printf("\n");
+// 	// printf("call opendir(%s)\n", NFSDIR);
+// 	// if (nfs_opendir_async(nfs, NFSDIR, nfs_opendir_cb, client) != 0) {
+// 	// 	printf("Failed to start async nfs close\n");
+// 	// 	exit(10);
+// 	// }
+// }
+
+
+
+
+/**
+ * Writes num_pwrites * pwrite_count bytes to the NFS server in parallel
+ * starting at designated offset
+*/
+void nfs_pwrite_async_batch(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t offset,
+                 uint64_t num_pwrites, uint64_t pwrite_count, const void *buf, nfs_cb cb, void *private_data) 
+{
+	struct batch_pwrite_cb_data *data;
+	initialize_batch_pwrite_cb_data_ptr(nfs, &data, private_data, num_pwrites, cb);
+
+	for (uint64_t i = 0; i < num_pwrites; i++) {
+		if (nfs_pwrite_async(nfs, nfsfh, offset + i * pwrite_count, pwrite_count, buf, nfs_batch_single_pwrite_cb, data) != 0) {
+			printf("Failed to start async nfs write\n");
+			exit(10);
+		}
+	}
+}
 
 void mount_export_cb(struct rpc_context *mount_context, int status, void *data, void *private_data)
 {
@@ -229,6 +305,35 @@ void nfs_write_cb(int status, struct nfs_context *nfs, void *data, void *private
 	}
 }
 
+void nfs_pwrite_async_batch_cb(int status, struct nfs_context *nfs, void* data, void* private_data) {
+	struct client *client = private_data;
+
+	printf("\n");
+	printf("Fstat file :%s\n", NFSFILE);
+	if (nfs_fstat64_async(nfs, client->nfsfh, nfs_fstat64_cb, client) != 0) {
+		printf("Failed to start async nfs fstat\n");
+		exit(10);
+	}
+}
+
+void nfs_batch_single_pwrite_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+{
+	struct batch_pwrite_cb_data *cb_data = private_data;
+	cb_data->completed_pwrites += 1;
+
+	if (status < 0) {
+		printf("batch pwrite failed\n");
+		exit(10);
+	}
+
+	printf("write %ld of batch successful with %d bytes of data\n", cb_data->completed_pwrites, status);
+
+	if (cb_data->completed_pwrites == cb_data->num_pwrites) {
+		cb_data->batch_cb(0, nfs, data, cb_data->private_data);
+		// nfs_pwrite_async_batch_cb(nfs, cb_data->private_data);
+	}
+}
+
 void nfs_open_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct client *client = private_data;
@@ -269,16 +374,17 @@ void nfs_open_cb_write(int status, struct nfs_context *nfs, void *data, void *pr
 	// Allocate and initialize character buffer
 	char_buf = (char *)malloc(BYTES_WRITE);
 	assert(char_buf != NULL);
-	memset(char_buf, 'c', BYTES_WRITE);
+	memset(char_buf, WRITE_CHAR, BYTES_WRITE);
 
 	printf("\nWriting first %d bytes\n", BYTES_WRITE);
 
 	// begin measurement
 	clock_gettime(CLOCK_MONOTONIC, &time_start);
-	if (nfs_pwrite_async(nfs, nfsfh, 0, BYTES_WRITE, char_buf, nfs_write_cb, client) != 0) {
-		printf("Failed to start async nfs open\n");
-		exit(10);
-	}
+	// if (nfs_pwrite_async(nfs, nfsfh, 0, BYTES_WRITE, char_buf, nfs_write_cb, client) != 0) {
+	// 	printf("Failed to start async nfs open\n");
+	// 	exit(10);
+	// }
+	nfs_pwrite_async_batch(nfs, nfsfh, 0, 5, BYTES_WRITE, char_buf, nfs_pwrite_async_batch_cb, client);
 }
 
 void nfs_stat64_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
