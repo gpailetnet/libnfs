@@ -60,11 +60,11 @@ char* char_buf = NULL;
 #define NFSDIR "/books/classics/" // containing directory of NFSFILE
 
 // Input parameters for parallel writes in batches done in series
-#define OFFSET 10
-#define NUM_BATCH_WRITES 10
-#define NUM_PWRITES 10
+#define OFFSET 0
+#define NUM_BATCH_WRITES 1
+#define NUM_PWRITES 1024
 #define BYTES_READ (1024 * 1024 * 512)
-#define BYTES_WRITE (3)
+#define BYTES_WRITE (1024 * 1024)
 #define WRITE_CHAR 'z'
 
 #include <stdio.h>
@@ -107,6 +107,10 @@ struct batch_series_pwrite_cb_data {
 	uint64_t num_pwrites;
 	uint64_t pwrite_count;
 	const void *buf;
+
+	// used for timing the entire operation
+	struct timespec* start_time;
+	struct timespec* end_time;
 };
 
 /**
@@ -168,6 +172,11 @@ int initialize_batch_series_pwrite_cb_data_ptr(struct batch_series_pwrite_cb_dat
 	(*data_ptr)->offset = offset;
 	(*data_ptr)->pwrite_count = pwrite_count;
 	(*data_ptr)->buf = buf;
+	(*data_ptr)->start_time = (struct timespec *) malloc(sizeof(struct timespec));
+	(*data_ptr)->end_time = (struct timespec *) malloc(sizeof(struct timespec));
+
+	clock_gettime(CLOCK_MONOTONIC, (*data_ptr)->start_time);
+
     return 0;
 }
 
@@ -180,7 +189,6 @@ void nfs_pwrite_series_async(struct nfs_context *nfs, struct nfsfh *nfsfh, uint6
 	initialize_batch_series_pwrite_cb_data_ptr(&data, nfs, nfsfh, offset,
         num_batch_writes, num_pwrites, pwrite_count, buf, cb, private_data);
 
-	// TODO: fill in NULL value with callback function
 	nfs_pwrite_async_batch(nfs, nfsfh, offset, num_pwrites, pwrite_count, 
 		buf, nfs_pwrite_async_batch_series_cb, data);
 }
@@ -364,10 +372,19 @@ void nfs_pwrite_async_batch_series_cb(int status, struct nfs_context *nfs, void*
 
 	uint64_t bytes_written = cb_data->num_pwrites * cb_data->pwrite_count;
 
-	printf("writing batch %ld successful with %d bytes of data\n\n", cb_data->completed_batch_writes, bytes_written);
+	// printf("writing batch %ld successful with %ld bytes of data\n\n", cb_data->completed_batch_writes, bytes_written);
 
 	// get the counter value; comapare to the total needed to complete
 	if (cb_data->completed_batch_writes == cb_data->num_batch_writes) {
+		// We have completed the operation so we get the time
+		clock_gettime(CLOCK_MONOTONIC, cb_data->end_time);
+		double time_diff;
+		set_time_diff(cb_data->start_time, cb_data->end_time, &time_diff);
+		printf("Time of writes was: %f seconds\n", time_diff);
+		uint64_t total_bytes_written = cb_data->completed_batch_writes * bytes_written;
+		printf("Total written bytes: %ld\n", total_bytes_written);
+		printf("Bandwidth: %f MB/s\n", total_bytes_written / time_diff / 1000000);
+
 		cb_data->batch_series_cb(0, nfs, data, cb_data->private_data);
 	}
 	else {
@@ -401,7 +418,7 @@ void nfs_batch_single_pwrite_cb(int status, struct nfs_context *nfs, void *data,
 		exit(10);
 	}
 
-	printf("write %ld of batch successful with %d bytes of data\n", cb_data->completed_pwrites, status);
+	// printf("write %ld of batch successful with %d bytes of data\n", cb_data->completed_pwrites, status);
 
 	if (cb_data->completed_pwrites == cb_data->num_pwrites) {
 		cb_data->batch_cb(0, nfs, data, cb_data->private_data);
