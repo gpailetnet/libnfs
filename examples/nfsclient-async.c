@@ -58,9 +58,14 @@ char* char_buf = NULL;
 #define EXPORT "/mnt/myshareddir" // exported directory of NFS server
 #define NFSFILE "/books/classics/dracula.txt" // path within exported directory to file to read
 #define NFSDIR "/books/classics/" // containing directory of NFSFILE
+
+// Input parameters for parallel writes in batches done in series
+#define OFFSET 10
+#define NUM_BATCH_WRITES 10
+#define NUM_PWRITES 10
 #define BYTES_READ (1024 * 1024 * 512)
-#define BYTES_WRITE (10)
-#define WRITE_CHAR 'f'
+#define BYTES_WRITE (3)
+#define WRITE_CHAR 'z'
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -91,15 +96,37 @@ struct batch_pwrite_cb_data {
 	uint64_t num_pwrites;
 };
 
+
+struct batch_series_pwrite_cb_data {
+	void* private_data;
+	nfs_cb batch_series_cb;
+	struct nfsfh *nfsfh;
+	uint64_t completed_batch_writes;
+	uint64_t num_batch_writes;
+	uint64_t offset;
+	uint64_t num_pwrites;
+	uint64_t pwrite_count;
+	const void *buf;
+};
+
+/**
+ * Callback for a batch write operation within a series; increments the batch
+ * counter, checks for termination; if so, calls the batch series callback,
+ * otherwise recalls the batch write operation
+*/
+void nfs_pwrite_async_batch_series_cb(int status, struct nfs_context *nfs, void* data, void* private_data);
+
 /**
  * The callback for a single pwrite within a batch operation.  Increments the total count of 
  * completed writes within the batch
 */
 void nfs_batch_single_pwrite_cb(int status, struct nfs_context *nfs, void *data, void *private_data);
 
-int initialize_batch_pwrite_cb_data_ptr(struct nfs_context *nfs, 
-	struct batch_pwrite_cb_data **data_ptr, void *private_data, 
-	uint64_t num_pwrites, nfs_cb cb) 
+/**
+ * Allocate the pointer and add relevant data structures
+*/
+int initialize_batch_pwrite_cb_data_ptr(struct batch_pwrite_cb_data **data_ptr, 
+	struct nfs_context *nfs, void *private_data, uint64_t num_pwrites, nfs_cb cb)
 {
 	*data_ptr = (struct batch_pwrite_cb_data*) malloc(sizeof(**data_ptr));
 	if (*data_ptr == NULL) {
@@ -116,26 +143,47 @@ int initialize_batch_pwrite_cb_data_ptr(struct nfs_context *nfs,
 	return 0;
 }
 
-// void nfs_pwrite_async_batch_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
-// {
-// 	printf("Callback called");
-// 	// struct client *client = private_data;
+/**
+ * Allocate the pointer and add relevant data structures
+*/
+int initialize_batch_series_pwrite_cb_data_ptr(struct batch_series_pwrite_cb_data** data_ptr, 
+			struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t offset,
+            uint64_t num_batch_writes, uint64_t num_pwrites, uint64_t pwrite_count,
+			const void *buf, nfs_cb cb, void *private_data) 
+{
+	*data_ptr = (struct batch_series_pwrite_cb_data*) malloc(sizeof(**data_ptr));
+	if (*data_ptr == NULL) {
+			nfs_set_error(nfs, "Out of memory. Failed to allocate "
+							"cb data");
+			return -1;
+	}
+	memset(*data_ptr, 0, sizeof(**data_ptr));
 
-// 	// if (status < 0) {
-// 	// 	printf("close failed with \"%s\"\n", (char *)data);
-// 	// 	exit(10);
-// 	// }
-
-// 	// printf("close successful\n");
-// 	// printf("\n");
-// 	// printf("call opendir(%s)\n", NFSDIR);
-// 	// if (nfs_opendir_async(nfs, NFSDIR, nfs_opendir_cb, client) != 0) {
-// 	// 	printf("Failed to start async nfs close\n");
-// 	// 	exit(10);
-// 	// }
-// }
+	(*data_ptr)->private_data = private_data;
+	(*data_ptr)->batch_series_cb = cb;
+	(*data_ptr)->completed_batch_writes = 0;
+	(*data_ptr)->num_batch_writes = num_batch_writes;
+	(*data_ptr)->num_pwrites = num_pwrites;
+	(*data_ptr)->nfsfh = nfsfh;
+	(*data_ptr)->offset = offset;
+	(*data_ptr)->pwrite_count = pwrite_count;
+	(*data_ptr)->buf = buf;
+    return 0;
+}
 
 
+
+void nfs_pwrite_series_async(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t offset,
+			uint64_t num_batch_writes, uint64_t num_pwrites, uint64_t pwrite_count,
+			const void *buf, nfs_cb cb, void *private_data) {
+	struct batch_series_pwrite_cb_data* data;
+	initialize_batch_series_pwrite_cb_data_ptr(&data, nfs, nfsfh, offset,
+        num_batch_writes, num_pwrites, pwrite_count, buf, cb, private_data);
+
+	// TODO: fill in NULL value with callback function
+	nfs_pwrite_async_batch(nfs, nfsfh, offset, num_pwrites, pwrite_count, 
+		buf, nfs_pwrite_async_batch_series_cb, data);
+}
 
 
 /**
@@ -146,7 +194,7 @@ void nfs_pwrite_async_batch(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64
                  uint64_t num_pwrites, uint64_t pwrite_count, const void *buf, nfs_cb cb, void *private_data) 
 {
 	struct batch_pwrite_cb_data *data;
-	initialize_batch_pwrite_cb_data_ptr(nfs, &data, private_data, num_pwrites, cb);
+	initialize_batch_pwrite_cb_data_ptr(&data, nfs, private_data, num_pwrites, cb);
 
 	for (uint64_t i = 0; i < num_pwrites; i++) {
 		if (nfs_pwrite_async(nfs, nfsfh, offset + i * pwrite_count, pwrite_count, buf, nfs_batch_single_pwrite_cb, data) != 0) {
@@ -305,6 +353,33 @@ void nfs_write_cb(int status, struct nfs_context *nfs, void *data, void *private
 	}
 }
 
+void nfs_pwrite_async_batch_series_cb(int status, struct nfs_context *nfs, void* data, void* private_data) {
+	struct batch_series_pwrite_cb_data *cb_data = private_data;
+	cb_data->completed_batch_writes += 1;
+
+	if (status < 0) {
+		printf("Batch write failed: %d\n", status);
+		exit(10);
+	}
+
+	uint64_t bytes_written = cb_data->num_pwrites * cb_data->pwrite_count;
+
+	printf("writing batch %ld successful with %d bytes of data\n\n", cb_data->completed_batch_writes, bytes_written);
+
+	// get the counter value; comapare to the total needed to complete
+	if (cb_data->completed_batch_writes == cb_data->num_batch_writes) {
+		cb_data->batch_series_cb(0, nfs, data, cb_data->private_data);
+	}
+	else {
+		uint64_t current_offset = cb_data->offset + 
+			cb_data->completed_batch_writes * bytes_written;
+
+		nfs_pwrite_async_batch(nfs, cb_data->nfsfh, current_offset, 
+		cb_data->num_pwrites, cb_data->pwrite_count, 
+		cb_data->buf, nfs_pwrite_async_batch_series_cb, private_data);
+	}
+}
+
 void nfs_pwrite_async_batch_cb(int status, struct nfs_context *nfs, void* data, void* private_data) {
 	struct client *client = private_data;
 
@@ -384,7 +459,7 @@ void nfs_open_cb_write(int status, struct nfs_context *nfs, void *data, void *pr
 	// 	printf("Failed to start async nfs open\n");
 	// 	exit(10);
 	// }
-	nfs_pwrite_async_batch(nfs, nfsfh, 0, 5, BYTES_WRITE, char_buf, nfs_pwrite_async_batch_cb, client);
+	nfs_pwrite_series_async(nfs, nfsfh, OFFSET, NUM_BATCH_WRITES, NUM_PWRITES, BYTES_WRITE, char_buf, nfs_pwrite_async_batch_cb, client);
 }
 
 void nfs_stat64_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
