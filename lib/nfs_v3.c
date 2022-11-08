@@ -4833,6 +4833,113 @@ out:
 	return;
 }
 
+/**
+ * Create a callback data structure from a passed in data buffer and
+ * return an error code if malloc'ing fails
+ * 
+ * For now, we assume we are doing no page cache or read-ahead stuff
+ * But this may change in the future and shouldn't be hard to change...
+*/
+int 
+init_read_cb_data_from_buffer(struct nfs_context *nfs, struct nfsfh *nfsfh,
+                          uint64_t offset, size_t count, nfs_cb cb,
+                          void *private_data, int update_pos, struct nfs_cb_data** data_ptr,
+						  void* buf) 
+{
+	*data_ptr = (struct nfs_cb_data*) malloc(sizeof(struct nfs_cb_data));
+	if (*data_ptr == NULL) {
+		nfs_set_error(nfs, "out of memory: failed to allocate "
+                              "nfs_cb_data structure");
+		return -1;
+	}
+	memset(*data_ptr, 0, sizeof(struct nfs_cb_data));
+	(*data_ptr)->nfs          = nfs;
+	(*data_ptr)->cb           = cb;
+	(*data_ptr)->private_data = private_data;
+	(*data_ptr)->nfsfh        = nfsfh;
+	(*data_ptr)->org_offset   = offset;
+	(*data_ptr)->org_count    = count;
+	(*data_ptr)->update_pos   = update_pos;
+	(*data_ptr)->buffer       = buf;
+
+	(*data_ptr)->max_offset   = (*data_ptr)->offset;
+	// so we don't destroy when freeing the data
+	(*data_ptr)->not_my_buffer= 1;
+
+	return 0;
+}
+
+/**
+ * Same as nfs3_pread_async_internal, but we pass in the buffer that we want
+ * to read into, rather than the system creating its own buffer; 
+ * 
+ * This is to save an additional copy that would happen for applications that 
+ * use the system
+*/
+int 
+nfs3_pread_async_internal_buffer(struct nfs_context *nfs, struct nfsfh *nfsfh,
+                          uint64_t offset, size_t count, nfs_cb cb,
+                          void *private_data, int update_pos, void* buf) 
+{
+	// initialize callback data with supplied buffer
+	struct nfs_cb_data *data;
+	int init_status = init_read_cb_data_from_buffer(nfs, nfsfh, offset, count, cb, 
+											private_data, update_pos, &data, buf);
+	if (init_status!= 0) {
+		return init_status;
+	}
+
+	/* chop requests into chunks of at most READMAX bytes if necessary.
+	 * we send all reads in parallel so that performance is still good.
+	 */
+	do {
+		size_t readcount = count;
+		struct nfs_mcb_data *mdata;
+		READ3args args;
+
+		if (readcount > nfs_get_readmax(nfs)) {
+		  readcount = (size_t)nfs_get_readmax(nfs);
+		}
+
+		mdata = malloc(sizeof(struct nfs_mcb_data));
+		if (mdata == NULL) {
+			nfs_set_error(nfs, "out of memory: failed to allocate nfs_mcb_data structure");
+			if (data->num_calls == 0) {
+				free_nfs_cb_data(data);
+				return -1;
+			}
+			data->oom = 1;
+			break;
+		}
+		memset(mdata, 0, sizeof(struct nfs_mcb_data));
+		mdata->data   = data;
+		mdata->offset = offset;
+		mdata->count  = readcount;
+
+		nfs3_fill_READ3args(&args, nfsfh, offset, readcount);
+
+		data->num_calls++;
+		if (rpc_nfs3_read_async(nfs->rpc, nfs3_pread_mcb,
+                                        &args, mdata) != 0) {
+			data->num_calls--;
+			nfs_set_error(nfs, "RPC error: Failed to send READ "
+                                      "call for %s", data->path);
+			free(mdata);
+			if (data->num_calls == 0) {
+				free_nfs_cb_data(data);
+				return -1;
+			}
+			data->oom = 1;
+			break;
+		}
+
+		count               -= readcount;
+		offset              += readcount;
+	 } while (count > 0);
+
+	 return 0;
+}
+
 int
 nfs3_pread_async_internal(struct nfs_context *nfs, struct nfsfh *nfsfh,
                           uint64_t offset, size_t count, nfs_cb cb,

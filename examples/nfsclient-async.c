@@ -54,14 +54,14 @@ char* char_buf = NULL;
 
 
 // Input parameters for client; configure these as needed
-#define SERVER "172.30.8.6" // ip address of NFS server
+#define SERVER "172.30.8.223" // ip address of NFS server
 #define EXPORT "/mnt/ramdisk" // exported directory of NFS server
 #define NFSFILE "/books/classics/dracula.txt" // path within exported directory to file to read
 #define NFSDIR "/books/classics/" // containing directory of NFSFILE
 
 // Input parameters for parallel writes in batches done in series
-#define WRITE_OFFSET 12
-#define NUM_BATCH_WRITES 1
+#define WRITE_OFFSET 196
+#define NUM_BATCH_WRITES 2
 #define NUM_PWRITES 1024
 #define BYTES_WRITE (1024 * 1024)
 #define WRITE_CHAR 'a'
@@ -70,7 +70,9 @@ char* char_buf = NULL;
 #define READ_OFFSET 0
 #define NUM_BATCH_READS 1
 #define NUM_PREADS 1014
-#define BYTES_READ (1024 * 1024)
+#define BYTES_READ (5 * 1024 * 1024)
+
+char read_buf[BYTES_READ];
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -410,7 +412,7 @@ void nfs_fstat64_cb(int status, struct nfs_context *nfs, void *data, void *priva
 	printf("Got reply from server for fstat(%s).\n", NFSFILE);
 	st = (struct nfs_stat_64 *)data;
 	printf("Mode %04o\n", (int)st->nfs_mode);
-	printf("Size %d\n", (int)st->nfs_size);
+	printf("Size %ld\n", st->nfs_size);
 	printf("Inode %04o\n", (int)st->nfs_ino);
 	printf("\n");
 
@@ -436,7 +438,7 @@ void nfs_read_cb(int status, struct nfs_context *nfs, void *data, void *private_
 		exit(10);
 	}
 
-	printf("read successful with %d bytes of data\n", status);
+	printf("read successful with %ld bytes of data\n", status);
 	printf("Time of read was: %f seconds\n", time_diff);
 
 	int BYTES_READ_DISPLAY = 16;
@@ -445,6 +447,14 @@ void nfs_read_cb(int status, struct nfs_context *nfs, void *data, void *private_
 	for (i=0; i < BYTES_READ_DISPLAY; i++) {
 		printf("%02x ", read_data[i]&0xff);
 	}
+	printf("\n");
+
+	for (i=0; i < BYTES_READ_DISPLAY; i++) {
+		printf("%02x ", read_buf[i]&0xff);
+	}
+
+	printf(&read_data, " ", &read_buf, "\n");
+
 	printf("\n");
 	printf("Fstat file :%s\n", NFSFILE);
 	if (nfs_fstat64_async(nfs, client->nfsfh, nfs_fstat64_cb, client) != 0) {
@@ -637,13 +647,20 @@ void nfs_open_cb(int status, struct nfs_context *nfs, void *data, void *private_
 
 	// begin measurement
 	clock_gettime(CLOCK_MONOTONIC, &time_start);
+
+	if (nfs3_pread_async_internal_buffer(nfs, nfsfh, 0, BYTES_READ, nfs_read_cb, client, 0, read_buf) != 0) {
+		printf("Failed to start async nfs open\n");
+		exit(10);
+	}
 	// if (nfs_pread_async(nfs, nfsfh, 0, BYTES_READ, nfs_read_cb, client) != 0) {
 	// 	printf("Failed to start async nfs open\n");
 	// 	exit(10);
 	// }
 	// nfs_pread_batch_async(nfs, nfsfh, 0, 5, BYTES_READ, nfs_pread_batch_async_cb, client);
-	nfs_pread_series_async(nfs, nfsfh, READ_OFFSET, NUM_BATCH_READS, NUM_PREADS, BYTES_READ, nfs_pread_batch_async_cb, client);
+	// nfs_pread_series_async(nfs, nfsfh, READ_OFFSET, NUM_BATCH_READS, NUM_PREADS, BYTES_READ, nfs_pread_batch_async_cb, client);
 }
+
+
 
 void nfs_open_cb_write(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
@@ -688,7 +705,7 @@ void nfs_stat64_cb(int status, struct nfs_context *nfs, void *data, void *privat
 	printf("Got reply from server for stat(%s).\n", NFSFILE);
 	st = (struct nfs_stat_64 *)data;
 	printf("Mode %04o\n", (unsigned int) st->nfs_mode);
-	printf("Size %d\n", (int)st->nfs_size);
+	printf("Size %ld\n", st->nfs_size);
 	printf("Inode %04o\n", (int)st->nfs_ino);
 	printf("\n");
 
