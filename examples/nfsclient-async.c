@@ -40,8 +40,9 @@ WSADATA wsaData;
 // Time instrumentation used for profiling the code
 #include <time.h>
 
-struct timespec time_start, time_end;
+struct timespec time_start, time_end, time_end_copy;
 double time_diff;
+double time_diff_copy;
 
 void set_time_diff(struct timespec* time_start_pointer, struct timespec* time_end_pointer, double* time_diff_pointer) {
 	*time_diff_pointer = (time_end_pointer->tv_sec - time_start_pointer->tv_sec) 
@@ -60,19 +61,20 @@ char* char_buf = NULL;
 #define NFSDIR "/books/classics/" // containing directory of NFSFILE
 
 // Input parameters for parallel writes in batches done in series
-#define WRITE_OFFSET 196
-#define NUM_BATCH_WRITES 2
+#define WRITE_OFFSET 517
+#define NUM_BATCH_WRITES 9
 #define NUM_PWRITES 1024
 #define BYTES_WRITE (1024 * 1024)
 #define WRITE_CHAR 'a'
 
 // Input parameters for parallel reads in batches done in series
-#define READ_OFFSET 0
+#define READ_OFFSET 10
 #define NUM_BATCH_READS 1
 #define NUM_PREADS 1014
-#define BYTES_READ (5 * 1024 * 1024)
+#define BYTES_READ (1024)
 
 char read_buf[BYTES_READ];
+// char read_buf_copy[BYTES_READ];
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -427,7 +429,10 @@ void nfs_read_cb(int status, struct nfs_context *nfs, void *data, void *private_
 {
 	// get callback for completion of function
 	clock_gettime(CLOCK_MONOTONIC, &time_end);
+	memcpy(read_buf, data, BYTES_READ);
+	clock_gettime(CLOCK_MONOTONIC, &time_end_copy);
 	set_time_diff(&time_start, &time_end, &time_diff);
+	set_time_diff(&time_start, &time_end_copy, &time_diff_copy);
 
 	struct client *client = private_data;
 	char *read_data;
@@ -438,8 +443,12 @@ void nfs_read_cb(int status, struct nfs_context *nfs, void *data, void *private_
 		exit(10);
 	}
 
-	printf("read successful with %ld bytes of data\n", status);
+	printf("Read successful with %ld bytes of data\n", status);
 	printf("Time of read was: %f seconds\n", time_diff);
+	printf("Time of copy to buffer was: %f seconds\n", time_diff_copy);
+
+	printf("Bandwidth of read is: %f MB/s\n", BYTES_READ / time_diff / 1000000);
+	printf("Bandwidth of read and copy is: %f MB/s\n", BYTES_READ / time_diff_copy / 1000000);
 
 	int BYTES_READ_DISPLAY = 16;
 	read_data = data;
@@ -453,7 +462,7 @@ void nfs_read_cb(int status, struct nfs_context *nfs, void *data, void *private_
 		printf("%02x ", read_buf[i]&0xff);
 	}
 
-	printf(&read_data, " ", &read_buf, "\n");
+	// printf((void*) read_data, " ", (void*) read_buf, "\n");
 
 	printf("\n");
 	printf("Fstat file :%s\n", NFSFILE);
@@ -648,7 +657,7 @@ void nfs_open_cb(int status, struct nfs_context *nfs, void *data, void *private_
 	// begin measurement
 	clock_gettime(CLOCK_MONOTONIC, &time_start);
 
-	if (nfs3_pread_async_internal_buffer(nfs, nfsfh, 0, BYTES_READ, nfs_read_cb, client, 0, read_buf) != 0) {
+	if (nfs3_pread_async_internal_buffer(nfs, nfsfh, READ_OFFSET, BYTES_READ, nfs_read_cb, client, 0, read_buf) != 0) {
 		printf("Failed to start async nfs open\n");
 		exit(10);
 	}
@@ -685,11 +694,11 @@ void nfs_open_cb_write(int status, struct nfs_context *nfs, void *data, void *pr
 
 	// begin measurement
 	clock_gettime(CLOCK_MONOTONIC, &time_start);
-	// if (nfs_pwrite_async(nfs, nfsfh, 0, BYTES_WRITE, char_buf, nfs_write_cb, client) != 0) {
-	// 	printf("Failed to start async nfs open\n");
-	// 	exit(10);
-	// }
-	nfs_pwrite_series_async(nfs, nfsfh, WRITE_OFFSET, NUM_BATCH_WRITES, NUM_PWRITES, BYTES_WRITE, char_buf, nfs_pwrite_batch_async_cb, client);
+	if (nfs_pwrite_async(nfs, nfsfh, WRITE_OFFSET, BYTES_WRITE, char_buf, nfs_write_cb, client) != 0) {
+		printf("Failed to start async nfs open\n");
+		exit(10);
+	}
+	// nfs_pwrite_series_async(nfs, nfsfh, WRITE_OFFSET, NUM_BATCH_WRITES, NUM_PWRITES, BYTES_WRITE, char_buf, nfs_pwrite_batch_async_cb, client);
 }
 
 void nfs_stat64_cb(int status, struct nfs_context *nfs, void *data, void *private_data)

@@ -4858,6 +4858,7 @@ init_read_cb_data_from_buffer(struct nfs_context *nfs, struct nfsfh *nfsfh,
 	(*data_ptr)->private_data = private_data;
 	(*data_ptr)->nfsfh        = nfsfh;
 	(*data_ptr)->org_offset   = offset;
+	(*data_ptr)->offset    	  = offset;
 	(*data_ptr)->org_count    = count;
 	(*data_ptr)->update_pos   = update_pos;
 	(*data_ptr)->buffer       = buf;
