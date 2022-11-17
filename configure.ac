@@ -1,5 +1,5 @@
 AC_PREREQ(2.50)
-AC_INIT([libnfs], [1.11.0], [ronniesahlberg@gmail.com])
+AC_INIT([libnfs], [5.0.2], [ronniesahlberg@gmail.com])
 AC_CONFIG_HEADERS([config.h])
 AM_INIT_AUTOMAKE([-Wall foreign subdir-objects])
 AC_CANONICAL_HOST
@@ -25,11 +25,13 @@ fi
 AC_SYS_LARGEFILE
 
 #option: utils
+MAYBE_UTILS="utils"
 AC_ARG_ENABLE([utils],
               [AC_HELP_STRING([--enable-utils],
                               [Build util programs])],
-	      [MAYBE_UTILS=""],
-	      [MAYBE_UTILS="utils"])
+	      [if test $enableval = no ; then
+	    	    MAYBE_UTILS=""
+	       fi])
 AC_SUBST(MAYBE_UTILS)
 
 #option: examples
@@ -68,6 +70,26 @@ fi
 
 AC_SUBST(MAYBE_EXAMPLES)
 
+#option: examples
+AC_ARG_ENABLE([pthread],
+              [AC_HELP_STRING([--enable-pthread],
+                              [Build with pthread multithreading support])],
+	      [ENABLE_PTHREAD=$enableval],
+	      [ENABLE_PTHREAD="no"])
+if test x$ENABLE_PTHREAD = xyes; then
+# check for lpthread
+AC_CACHE_CHECK([for pthread support],libnfs_cv_HAVE_PTHREAD,[
+AC_TRY_COMPILE([
+#include <pthread.h>],
+[pthread_t thread1, thread2;],
+libnfs_cv_HAVE_PTHREAD=yes,libnfs_cv_HAVE_PTHREAD=no)])
+if test x"$libnfs_cv_HAVE_PTHREAD" = x"yes"; then
+    AC_DEFINE(HAVE_PTHREAD,1,[Whether we have pthread support])
+    AC_DEFINE(HAVE_MULTITHREADING,1,[Whether we have multithreading support])
+fi
+fi
+AM_CONDITIONAL([HAVE_PTHREAD], [test x$libnfs_cv_HAVE_PTHREAD = xyes])
+
 AC_MSG_CHECKING(whether SO_BINDTODEVICE is available)
 AC_TRY_COMPILE([#include <net/if.h>], [
         int i = SO_BINDTODEVICE;
@@ -79,6 +101,22 @@ else
   AC_MSG_RESULT(no)
   AC_MSG_NOTICE(SO_BINDTODEVICE support for if= support is missing.)
   AC_MSG_NOTICE(Compiling without if= support.)
+fi
+
+AC_MSG_CHECKING(whether getpwnam() is available)
+AC_TRY_COMPILE([
+	#include <sys/types.h>
+	#include <pwd.h>
+], [
+        struct passwd *pwd = getpwnam("nobody");
+], ac_cv_have_getpwnam=yes, ac_cv_have_getpwnam=no)
+if test "$ac_cv_have_getpwnam" = yes ; then
+  AC_MSG_RESULT(yes)
+  AC_DEFINE(HAVE_GETPWNAM, 1, [Whether we have getpwnam()])
+else
+  AC_MSG_RESULT(no)
+  AC_MSG_NOTICE(getpwnam() support is missing.)
+  AC_MSG_NOTICE(Compiling without getpwnam() support.)
 fi
 
 AC_ARG_ENABLE([werror], [AS_HELP_STRING([--disable-werror],
@@ -102,7 +140,7 @@ case $host in
     AC_CHECK_LIB([socket], [main], , [AC_MSG_ERROR([Can not find required library])])
     AC_CHECK_LIB([nsl],    [main], , [AC_MSG_ERROR([Can not find required library])])
     ;;
-  *mingw32* | *cygwin* | *wince* | *mingwce*)
+  *mingw32* | *wince* | *mingwce*)
     LIBSOCKET='-lws2_32'
     SYS=mingw32
     ;;
@@ -111,6 +149,10 @@ case $host in
 esac
 AM_CONDITIONAL(HAVE_WIN32,   test "${SYS}" = "mingw32")
 AC_SUBST([LIBSOCKET])
+
+# check for sys/sysmacros.h
+dnl Check for sys/sysmacros.h
+AC_CHECK_HEADERS([sys/sysmacros.h])
 
 # check for poll.h
 dnl Check for poll.h
@@ -148,6 +190,10 @@ AC_CHECK_HEADERS([sys/vfs.h])
 dnl Check for sys/statvfs.h
 AC_CHECK_HEADERS([sys/statvfs.h])
 
+# check for fuse.h
+dnl Check for fuse.h
+AC_CHECK_HEADERS([fuse.h])
+
 # check for sys/socket.h
 dnl Check for sys/socket.h
 AC_CHECK_HEADERS([sys/socket.h])
@@ -184,6 +230,20 @@ AC_CHECK_MEMBER([struct sockaddr_storage.ss_family],
 #include <sys/socket.h>
 ])
 
+# check for clock_gettime(CLOCK_MONOTONIC_COARSE)
+AC_MSG_CHECKING(if clock_gettime(CLOCK_MONOTONIC_COARSE) is available)
+AC_TRY_COMPILE([#include <time.h>], [
+        int i = clock_gettime(CLOCK_MONOTONIC_COARSE, NULL);
+], ac_cv_have_clock_gettime=yes, ac_cv_have_clock_gettime=no)
+if test "$ac_cv_have_clock_gettime" = yes ; then
+  AC_MSG_RESULT(yes)
+  AC_DEFINE(HAVE_CLOCK_GETTIME, 1, [Whether we have clock_gettime])
+else
+  AC_MSG_RESULT(no)
+  AC_MSG_NOTICE(clock_gettime(CLOCK_MONOTONIC_COARSE) support is missing.)
+  AC_MSG_NOTICE(Compiling without clock_gettime support..)
+fi
+
 # check for tevent + talloc
 AC_CACHE_CHECK([for talloc and tevent support],libnfs_cv_HAVE_TALLOC_TEVENT,[
 AC_TRY_COMPILE([
@@ -205,6 +265,7 @@ AC_HEADER_MAJOR
 #output
 AC_CONFIG_FILES([Makefile]
                 [doc/Makefile]
+                [examples/Makefile]
                 [include/Makefile]
                 [lib/Makefile]
                 [mount/Makefile]
@@ -214,8 +275,8 @@ AC_CONFIG_FILES([Makefile]
                 [nsm/Makefile]
                 [portmap/Makefile]
                 [rquota/Makefile]
+                [tests/Makefile]
                 [utils/Makefile]
-                [examples/Makefile]
                )
 
 AC_OUTPUT([libnfs.pc])

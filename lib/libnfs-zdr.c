@@ -1,3 +1,4 @@
+/* -*-  mode:c; tab-width:8; c-basic-offset:8; indent-tabs-mode:nil;  -*- */
 /*
    Copyright (C) 2012 by Ronnie Sahlberg <ronniesahlberg@gmail.com>
 
@@ -25,11 +26,19 @@
 #endif
 
 #ifdef WIN32
-#include "win32_compat.h"
+#include <win32/win32_compat.h>
 #endif
 
 #ifdef AROS
 #include "aros_compat.h"
+#endif
+
+#ifdef PS2_EE
+#include "ps2_compat.h"
+#endif
+
+#ifdef PS3_PPU
+#include "ps3_compat.h"
 #endif
 
 #ifdef HAVE_ARPA_INET_H
@@ -160,6 +169,9 @@ bool_t libnfs_zdr_int64_t(ZDR *zdrs, int64_t *i)
 
 bool_t libnfs_zdr_bytes(ZDR *zdrs, char **bufp, uint32_t *size, uint32_t maxsize)
 {
+        uint32_t zero = 0;
+        int pad;
+
 	if (!libnfs_zdr_u_int(zdrs, size)) {
 		return FALSE;
 	}
@@ -172,7 +184,13 @@ bool_t libnfs_zdr_bytes(ZDR *zdrs, char **bufp, uint32_t *size, uint32_t maxsize
 	case ZDR_ENCODE:
 		memcpy(&zdrs->buf[zdrs->pos], *bufp, *size);
 		zdrs->pos += *size;
-		zdrs->pos = (zdrs->pos + 3) & ~3;
+
+                pad = (4 - (zdrs->pos & 0x03)) & 0x03;
+                if (pad) {
+                        /* Make valgrind happy again */
+                        memcpy(&zdrs->buf[zdrs->pos], &zero, pad);
+                        zdrs->pos += pad;
+                }
 		return TRUE;
 	case ZDR_DECODE:
 		if (*bufp != NULL) {
@@ -279,15 +297,11 @@ bool_t libnfs_zdr_string(ZDR *zdrs, char **strp, uint32_t maxsize)
 		 * in place.
 		 */
 	  if (zdrs->size > zdrs->pos + (int)size && zdrs->buf[zdrs->pos + size] == 0) {
-			if (*strp == NULL) {
-				*strp = &zdrs->buf[zdrs->pos];
-                                (*strp)[size] = 0;
-                                zdrs->pos += size;
-                                zdrs->pos = (zdrs->pos + 3) & ~3;
-                                return TRUE;
-			}
+			*strp = &zdrs->buf[zdrs->pos];
 			(*strp)[size] = 0;
-			return libnfs_zdr_opaque(zdrs, *strp, size);
+			zdrs->pos += size;
+			zdrs->pos = (zdrs->pos + 3) & ~3;
+			return TRUE;
 		}
 
 		/* Crap. The string is not null terminated in the rx buffer.
@@ -307,17 +321,23 @@ bool_t libnfs_zdr_string(ZDR *zdrs, char **strp, uint32_t maxsize)
 bool_t libnfs_zdr_array(ZDR *zdrs, char **arrp, uint32_t *size, uint32_t maxsize, uint32_t elsize, zdrproc_t proc)
 {
 	int  i;
+        uint32_t s;
 
 	if (!libnfs_zdr_u_int(zdrs, size)) {
 		return FALSE;
 	}
 
+        if (*size > UINT32_MAX/elsize) {
+                return FALSE;
+        }
+        s = *size * elsize;
+
 	if (zdrs->x_op == ZDR_DECODE) {
-		*arrp = zdr_malloc(zdrs, *size * elsize);
+		*arrp = zdr_malloc(zdrs, s);
 		if (*arrp == NULL) {
 			return FALSE;
 		}
-		memset(*arrp, 0, *size * elsize);
+		memset(*arrp, 0, s);
 	}
 
 	for (i = 0; i < (int)*size; i++) {
@@ -556,7 +576,7 @@ struct AUTH *libnfs_authunix_create(const char *host, uint32_t uid, uint32_t gid
 	memset(auth->ah_cred.oa_base, 0x00, size);
 	buf = (uint32_t *)(void *)auth->ah_cred.oa_base;
 	idx = 0;
-	buf[idx++] = htonl(time(NULL));
+	buf[idx++] = htonl((uint32_t)rpc_current_time());
 	buf[idx++] = htonl(strlen(host));
 	memcpy(&buf[2], host, strlen(host));
 
@@ -579,7 +599,7 @@ struct AUTH *libnfs_authunix_create(const char *host, uint32_t uid, uint32_t gid
 
 struct AUTH *libnfs_authunix_create_default(void)
 {
-#ifdef WIN32
+#if defined(WIN32) || defined(PS3_PPU)
 	return libnfs_authunix_create("libnfs", 65534, 65534, 0, NULL);
 #else
 	return libnfs_authunix_create("libnfs", getuid(), getgid(), 0, NULL);

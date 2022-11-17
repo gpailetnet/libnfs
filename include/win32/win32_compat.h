@@ -33,14 +33,20 @@ THE SOFTWARE.
 #include <io.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <stddef.h> // For size_t type
 
-typedef int uid_t;
-typedef int gid_t;
+typedef unsigned long fsblkcnt_t;
+typedef unsigned long fsfilcnt_t;
+typedef unsigned int uid_t;
+typedef unsigned int gid_t;
 typedef int socklen_t;
 
+#ifndef S_IRUSR
 #define S_IRUSR 0000400
 #define S_IWUSR 0000200
 #define S_IXUSR 0000100
+#endif
+#ifndef S_IRWXG
 #define	S_IRWXG	0000070			/* RWX mask for group */
 #define S_IRGRP 0000040
 #define S_IWGRP 0000020
@@ -49,12 +55,23 @@ typedef int socklen_t;
 #define S_IROTH 0000004
 #define S_IWOTH 0000002
 #define S_IXOTH 0000001
+#endif
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 
 #define F_GETFL  3
 #define F_SETFL  4
 
 #ifndef S_IFLNK
 #define S_IFLNK        0xA000  /* Link */
+#endif
+
+#ifndef F_RDLCK
+#define F_RDLCK 0
+#define F_WRLCK 1
+#define F_UNLCK 2
 #endif
 
 #ifndef S_IFIFO
@@ -77,8 +94,17 @@ typedef int socklen_t;
 #define minor(a) 0
 #endif
 
+#ifndef O_NONBLOCK
 #define O_NONBLOCK 0x40000000
+#endif
+
+#ifndef O_SYNC
 #define O_SYNC 0
+#endif
+
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW	00400000
+#endif
 
 #define MSG_DONTWAIT 0
 #define ssize_t SSIZE_T
@@ -102,12 +128,18 @@ struct pollfd {
 #define close closesocket
 #define ioctl ioctlsocket
 
+#ifndef ESTALE
+#define ESTALE 116
+#endif
+
 /* Wrapper macros to call misc. functions win32 is missing */
 #define poll(x, y, z)        win32_poll(x, y, z)
-#define snprintf             sprintf_s
+//#define snprintf             sprintf_s
 #define inet_pton(x,y,z)     win32_inet_pton(x,y,z)
 #define open(x, y, z)        _open(x, y, z)
+#ifndef lseek
 #define lseek(x, y, z)       _lseek(x, y, z)
+#endif
 #define read(x, y, z)        _read(x, y, z)
 #define write(x, y, z)       _write(x, y, z)
 int     getpid(void);
@@ -119,5 +151,9 @@ int     win32_gettimeofday(struct timeval *tv, struct timezone *tz);
 #endif
 
 #define DllExport
+
+#ifdef __MINGW32__
+char* strndup(const char *s, size_t n);
+#endif
 
 #endif//win32_COMPAT_H_

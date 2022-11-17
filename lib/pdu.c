@@ -1,3 +1,4 @@
+/* -*-  mode:c; tab-width:8; c-basic-offset:8; indent-tabs-mode:nil;  -*- */
 /*
    Copyright (C) 2010 by Ronnie Sahlberg <ronniesahlberg@gmail.com>
 
@@ -22,8 +23,16 @@
 #include "aros_compat.h"
 #endif
 
+#ifdef PS2_EE
+#include "ps2_compat.h"
+#endif
+
+#ifdef PS3_PPU
+#include "ps3_compat.h"
+#endif
+
 #ifdef WIN32
-#include "win32_compat.h"
+#include <win32/win32_compat.h>
 #endif
 
 #ifdef HAVE_NETINET_IN_H
@@ -80,9 +89,9 @@ void rpc_return_to_queue(struct rpc_queue *q, struct rpc_pdu *pdu)
 		q->tail = pdu;
 }
 
-unsigned int rpc_hash_xid(uint32_t xid)
+unsigned int rpc_hash_xid(struct rpc_context *rpc, uint32_t xid)
 {
-	return (xid * 7919) % HASHES;
+	return (xid * 7919) % rpc->num_hashes;
 }
 
 #define PAD_TO_8_BYTES(x) ((x + 0x07) & ~0x07)
@@ -157,7 +166,17 @@ struct rpc_pdu *rpc_allocate_pdu2(struct rpc_context *rpc, int program, int vers
 		return NULL;
 	}
 	memset(pdu, 0, pdu_size);
+#ifdef HAVE_MULTITHREADING
+        if (rpc->multithreading_enabled) {
+                nfs_mt_mutex_lock(&rpc->rpc_mutex);
+        }
+#endif /* HAVE_MULTITHREADING */
 	pdu->xid                = rpc->xid++;
+#ifdef HAVE_MULTITHREADING
+        if (rpc->multithreading_enabled) {
+                nfs_mt_mutex_unlock(&rpc->rpc_mutex);
+        }
+#endif /* HAVE_MULTITHREADING */
 	pdu->cb                 = cb;
 	pdu->private_data       = private_data;
 	pdu->zdr_decode_fn      = zdr_decode_fn;
@@ -225,7 +244,17 @@ void rpc_free_pdu(struct rpc_context *rpc, struct rpc_pdu *pdu)
 
 void rpc_set_next_xid(struct rpc_context *rpc, uint32_t xid)
 {
+#ifdef HAVE_MULTITHREADING
+        if (rpc->multithreading_enabled) {
+                nfs_mt_mutex_lock(&rpc->rpc_mutex);
+        }
+#endif /* HAVE_MULTITHREADING */
 	rpc->xid = xid;
+#ifdef HAVE_MULTITHREADING
+        if (rpc->multithreading_enabled) {
+                nfs_mt_mutex_unlock(&rpc->rpc_mutex);
+        }
+#endif /* HAVE_MULTITHREADING */
 }
 
 int rpc_queue_pdu(struct rpc_context *rpc, struct rpc_pdu *pdu)
@@ -234,6 +263,22 @@ int rpc_queue_pdu(struct rpc_context *rpc, struct rpc_pdu *pdu)
         uint32_t recordmarker;
 
 	assert(rpc->magic == RPC_CONTEXT_MAGIC);
+
+	if (rpc->timeout > 0) {
+		pdu->timeout = rpc_current_time() + rpc->timeout;
+#ifndef HAVE_CLOCK_GETTIME
+		/* If we do not have GETTIME we fallback to time() which
+		 * has 1s granularity for its timestamps.
+		 * We thus need to bump the timeout by 1000ms
+		 * so that the PDU will timeout within 1.0 - 2.0 seconds.
+		 * Otherwise setting a 1s timeout would trigger within
+		 * 0.001 - 1.0s.
+		 */
+		pdu->timeout += 1000;
+#endif
+	} else {
+		pdu->timeout = 0;
+	}
 
         for (i = 1; i < pdu->out.niov; i++) {
                 size += pdu->out.iov[i].len;
@@ -292,15 +337,42 @@ int rpc_queue_pdu(struct rpc_context *rpc, struct rpc_pdu *pdu)
                         }
                 }
 
-		hash = rpc_hash_xid(pdu->xid);
+		hash = rpc_hash_xid(rpc, pdu->xid);
+#ifdef HAVE_MULTITHREADING
+                if (rpc->multithreading_enabled) {
+                        nfs_mt_mutex_lock(&rpc->rpc_mutex);
+                }
+#endif /* HAVE_MULTITHREADING */
 		rpc_enqueue(&rpc->waitpdu[hash], pdu);
 		rpc->waitpdu_len++;
+#ifdef HAVE_MULTITHREADING
+                if (rpc->multithreading_enabled) {
+                        nfs_mt_mutex_unlock(&rpc->rpc_mutex);
+                }
+#endif /* HAVE_MULTITHREADING */
 		return 0;
 	}
 
 	pdu->outdata.size = size;
-	rpc_enqueue(&rpc->outqueue, pdu);
-
+#ifdef HAVE_MULTITHREADING
+        if (rpc->multithreading_enabled) {
+                nfs_mt_mutex_lock(&rpc->rpc_mutex);
+        }
+#endif /* HAVE_MULTITHREADING */
+        rpc_enqueue(&rpc->outqueue, pdu);
+#ifdef HAVE_MULTITHREADING
+        if (rpc->outqueue.head == pdu) {
+                if (rpc->multithreading_enabled) {
+                        nfs_mt_mutex_unlock(&rpc->rpc_mutex);
+                }
+                rpc_write_to_socket(rpc);
+        } else {
+                if (rpc->multithreading_enabled) {
+                        nfs_mt_mutex_unlock(&rpc->rpc_mutex);
+                }
+        }
+#endif /* HAVE_MULTITHREADING */
+        
 	return 0;
 }
 
@@ -473,7 +545,8 @@ static int rpc_process_call(struct rpc_context *rpc, ZDR *zdr)
         if (endpoint == NULL) {
 		rpc_set_error(rpc, "No endpoint found for CALL "
                               "program:0x%08x version:%d\n",
-                              call.body.cbody.prog, call.body.cbody.vers);
+                              (int)call.body.cbody.prog,
+                              (int)call.body.cbody.vers);
                 if (!found_program) {
                         return rpc_send_error_reply(rpc, &call, PROG_UNAVAIL,
                                                     0, 0);
@@ -491,7 +564,7 @@ static int rpc_process_call(struct rpc_context *rpc, ZDR *zdr)
                                               "call payload");
                                 return rpc_send_error_reply(rpc, &call, GARBAGE_ARGS, 0 ,0);
                         }
-                        return endpoint->procs[i].func(rpc, &call);
+                        return endpoint->procs[i].func(rpc, &call, endpoint->procs[i].opaque);
                 }
         }
 
@@ -503,7 +576,8 @@ int rpc_process_pdu(struct rpc_context *rpc, char *buf, int size)
 	struct rpc_pdu *pdu, *prev_pdu;
 	struct rpc_queue *q;
 	ZDR zdr;
-	int pos, recordmarker = 0;
+	int pos;
+        int32_t recordmarker = 0;
 	unsigned int hash;
 	uint32_t xid;
 	char *reasbuf = NULL;
@@ -538,6 +612,11 @@ int rpc_process_pdu(struct rpc_context *rpc, char *buf, int size)
 		zdr_destroy(&zdr);
 		for (fragment = rpc->fragments; fragment; fragment = fragment->next) {
 			total += fragment->size;
+                        if (total < fragment->size) {
+                                rpc_set_error(rpc, "Fragments too large");
+                                rpc_free_all_fragments(rpc);
+                                return -1;
+                        }
 		}
 
 		reasbuf = malloc(total);
@@ -568,7 +647,7 @@ int rpc_process_pdu(struct rpc_context *rpc, char *buf, int size)
         }
 
 	pos = zdr_getpos(&zdr);
-	if (zdr_int(&zdr, (int *)&xid) == 0) {
+	if (zdr_u_int(&zdr, &xid) == 0) {
 		rpc_set_error(rpc, "zdr_int reading xid failed");
 		zdr_destroy(&zdr);
 		if (reasbuf != NULL) {
@@ -579,7 +658,12 @@ int rpc_process_pdu(struct rpc_context *rpc, char *buf, int size)
 	zdr_setpos(&zdr, pos);
 
 	/* Look up the transaction in a hash table of our requests */
-	hash = rpc_hash_xid(xid);
+	hash = rpc_hash_xid(rpc, xid);
+#ifdef HAVE_MULTITHREADING
+        if (rpc->multithreading_enabled) {
+                nfs_mt_mutex_lock(&rpc->rpc_mutex);
+        }
+#endif /* HAVE_MULTITHREADING */
 	q = &rpc->waitpdu[hash];
 
 	/* Follow the hash chain.  Linear traverse singly-linked list,
@@ -600,6 +684,11 @@ int rpc_process_pdu(struct rpc_context *rpc, char *buf, int size)
 				prev_pdu->next = pdu->next;
 			rpc->waitpdu_len--;
 		}
+#ifdef HAVE_MULTITHREADING
+                if (rpc->multithreading_enabled) {
+                        nfs_mt_mutex_unlock(&rpc->rpc_mutex);
+                }
+#endif /* HAVE_MULTITHREADING */
 		if (rpc_process_reply(rpc, pdu, &zdr) != 0) {
 			rpc_set_error(rpc, "rpc_procdess_reply failed");
 		}
@@ -612,11 +701,16 @@ int rpc_process_pdu(struct rpc_context *rpc, char *buf, int size)
 		}
 		return 0;
 	}
-	rpc_set_error(rpc, "No matching pdu found for xid:%d", xid);
+#ifdef HAVE_MULTITHREADING
+        if (rpc->multithreading_enabled) {
+                nfs_mt_mutex_unlock(&rpc->rpc_mutex);
+        }
+#endif /* HAVE_MULTITHREADING */
+
 	zdr_destroy(&zdr);
 	if (reasbuf != NULL) {
 		free(reasbuf);
 	}
-	return -1;
+	return 0;
 }
 

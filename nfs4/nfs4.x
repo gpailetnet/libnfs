@@ -1,37 +1,4 @@
-/* -*-  mode:c; tab-width:8; c-basic-offset:8; indent-tabs-mode:nil;  -*- */
-/*
- * The definitions in this file are based on RFC3530.
- */
-
-/* RFC3530 contains the following copyright statement:
-
-
-   Copyright (C) The Internet Society (2003).  All Rights Reserved.
-
-   This document and translations of it may be copied and furnished to
-   others, and derivative works that comment on or otherwise explain it
-   or assist in its implementation may be prepared, copied, published
-   and distributed, in whole or in part, without restriction of any
-   kind, provided that the above copyright notice and this paragraph are
-   included on all such copies and derivative works.  However, this
-   document itself may not be modified in any way, such as by removing
-   the copyright notice or references to the Internet Society or other
-   Internet organizations, except as needed for the purpose of
-   developing Internet standards in which case the procedures for
-   copyrights defined in the Internet Standards process must be
-   followed, or as required to translate it into languages other than
-   English.
-
-   The limited permissions granted above are perpetual and will not be
-   revoked by the Internet Society or its successors or assigns.
-
-   This document and the information contained herein is provided on an
-   "AS IS" basis and THE INTERNET SOCIETY AND THE INTERNET ENGINEERING
-   TASK FORCE DISCLAIMS ALL WARRANTIES, EXPRESS OR IMPLIED, INCLUDING
-   BUT NOT LIMITED TO ANY WARRANTY THAT THE USE OF THE INFORMATION
-   HEREIN WILL NOT INFRINGE ANY RIGHTS OR ANY IMPLIED WARRANTIES OF
-   MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
-*/
+/* This is based on RFC3530 */
 
 /*
  * NFS v4 Definitions
@@ -54,7 +21,7 @@
 const NFS4_FHSIZE               = 128;
 const NFS4_VERIFIER_SIZE        = 8;
 const NFS4_OPAQUE_LIMIT         = 1024;
-
+const NFS4_SESSIONID_SIZE       = 16;
 /*
  * File types
  */
@@ -140,7 +107,20 @@ enum nfsstat4 {
      NFS4ERR_DEADLOCK        = 10045,/* file locking deadlock   */
      NFS4ERR_FILE_OPEN       = 10046,/* open file blocks op.    */
      NFS4ERR_ADMIN_REVOKED   = 10047,/* lockowner state revoked */
-     NFS4ERR_CB_PATH_DOWN    = 10048 /* callback path down      */
+     NFS4ERR_CB_PATH_DOWN    = 10048,/* callback path down      */
+     NFS4ERR_BADIOMODE       = 10049,
+     NFS4ERR_BADLAYOUT       = 10050,
+     NFS4ERR_BAD_SESSION_DIGEST = 10051,
+     NFS4ERR_BADSESSION      = 10052,
+     NFS4ERR_BADSLOT         = 10053,
+     NFS4ERR_COMPLETE_ALREADY = 10054,
+     NFS4ERR_CONN_NOT_BOUND_TO_SESSION = 10055,
+     NFS4ERR_DELEG_ALREADY_WANTED = 10056,
+     NFS4ERR_BACK_CHAN_BUSY  = 10057,
+     NFS4ERR_LAYOUTTRYLATER  = 10058,
+     NFS4ERR_LAYOUTUNAVAILABLE = 10059,
+     NFS4ERR_NOMATCHING_LAYOUT = 10060,
+     NFS4ERR_RECALLCONFLICT  = 10061
 };
 
 /*
@@ -151,7 +131,9 @@ typedef uint64_t        offset4;
 typedef uint32_t        count4;
 typedef uint64_t        length4;
 typedef uint64_t        clientid4;
+typedef uint32_t	sequenceid4;
 typedef uint32_t        seqid4;
+typedef uint32_t        slotid4;
 typedef opaque          utf8string<>;
 typedef utf8string      utf8str_cis;
 typedef utf8string      utf8str_cs;
@@ -166,6 +148,38 @@ typedef uint32_t        qop4;
 typedef uint32_t        mode4;
 typedef uint64_t        changeid4;
 typedef opaque          verifier4[NFS4_VERIFIER_SIZE];
+typedef opaque          sessionid4[NFS4_SESSIONID_SIZE];
+/*
+ * Authsys_parms
+ */
+struct authsys_parms {
+     unsigned int stamp;
+     string machinename<255>;
+     unsigned int uid;
+     unsigned int gid;
+     unsigned int gids<16>;
+};
+
+const NFS4_DEVICEID4_SIZE = 16;
+
+typedef opaque  deviceid4[NFS4_DEVICEID4_SIZE];
+
+enum layouttype4 {
+       LAYOUT4_NFSV4_1_FILES   = 0x1,
+       LAYOUT4_OSD2_OBJECTS    = 0x2,
+       LAYOUT4_BLOCK_VOLUME    = 0x3
+};
+
+struct layoutupdate4 {
+       layouttype4             lou_type;
+       opaque                  lou_body<>;
+};
+
+
+struct device_addr4 {
+       layouttype4             da_layout_type;
+       opaque                  da_addr_body<>;
+};
 
 /*
  * Timeval
@@ -178,6 +192,24 @@ struct nfstime4 {
 enum time_how4 {
      SET_TO_SERVER_TIME4 = 0,
      SET_TO_CLIENT_TIME4 = 1
+};
+
+enum layoutiomode4 {
+       LAYOUTIOMODE4_READ      = 1,
+       LAYOUTIOMODE4_RW        = 2,
+       LAYOUTIOMODE4_ANY       = 3
+};
+
+struct layout_content4 {
+       layouttype4 loc_type;
+       opaque      loc_body<>;
+};
+
+struct layout4 {
+       offset4                 lo_offset;
+       length4                 lo_length;
+       layoutiomode4           lo_iomode;
+       layout_content4         lo_content;
 };
 
 union settime4 switch (time_how4 set_it) {
@@ -918,7 +950,10 @@ enum open_claim_type4 {
         CLAIM_NULL              = 0,
         CLAIM_PREVIOUS          = 1,
         CLAIM_DELEGATE_CUR      = 2,
-        CLAIM_DELEGATE_PREV     = 3
+        CLAIM_DELEGATE_PREV     = 3,
+        CLAIM_FH                = 4, /* new to v4.1 */
+        CLAIM_DELEG_CUR_FH      = 5, /* new to v4.1 */
+        CLAIM_DELEG_PREV_FH     = 6 /* new to v4.1 */
 };
 
 struct open_claim_delegate_cur4 {
@@ -1262,19 +1297,13 @@ struct SAVEFH4res {
         nfsstat4        status;
 };
 
-#if 0
 /*
  * SECINFO: Obtain Available Security Mechanisms
  */
 struct SECINFO4args {
-        /* CURRENT_FH: directory */
         component4      name;
 };
 
-/*
-
- * From RFC 2203
- */
 enum rpc_gss_svc_t {
         RPC_GSS_SVC_NONE        = 1,
         RPC_GSS_SVC_INTEGRITY   = 2,
@@ -1287,7 +1316,8 @@ struct rpcsec_gss_info {
         rpc_gss_svc_t   service;
 };
 
-/* RPCSEC_GSS has a value of '6' - See RFC 2203 */
+const RPCSEC_GSS = 6;
+
 union secinfo4 switch (uint32_t flavor) {
  case RPCSEC_GSS:
          rpcsec_gss_info        flavor_info;
@@ -1303,7 +1333,6 @@ union SECINFO4res switch (nfsstat4 status) {
  default:
          void;
 };
-#endif
 
 /*
  * SETATTR: Set attributes
@@ -1406,6 +1435,456 @@ struct RELEASE_LOCKOWNER4res {
 };
 
 /*
+ * BACKCHANNEL_CTL
+ */
+/*
+typedef opaque gsshandle4_t<>;
+
+struct gss_cb_handles4 {
+       rpc_gss_svc_t           gcbp_service; RFC 2203
+       gsshandle4_t            gcbp_handle_from_server;
+       gsshandle4_t            gcbp_handle_from_client;
+};
+*/
+
+union callback_sec_parms4 switch (uint32_t cb_secflavor) {
+case AUTH_NONE:
+       void;
+case AUTH_SYS:
+       authsys_parms   cbsp_sys_cred; /* RFC 1831 */
+/*
+ * case RPCSEC_GSS:
+ *     gss_cb_handles4 cbsp_gss_handles;
+ */
+};
+
+/*
+struct BACKCHANNEL_CTL4args {
+       uint32_t                bca_cb_program;
+       callback_sec_parms4     bca_sec_parms<>;
+};
+*/
+
+/*
+ * CREATE_SESSION
+ */
+struct channel_attrs4 {
+       count4                  ca_headerpadsize;
+       count4                  ca_maxrequestsize;
+       count4                  ca_maxresponsesize;
+       count4                  ca_maxresponsesize_cached;
+       count4                  ca_maxoperations;
+       count4                  ca_maxrequests;
+       uint32_t                ca_rdma_ird<1>;
+};
+
+const CREATE_SESSION4_FLAG_PERSIST              = 0x00000001;
+const CREATE_SESSION4_FLAG_CONN_BACK_CHAN       = 0x00000002;
+const CREATE_SESSION4_FLAG_CONN_RDMA            = 0x00000004;
+
+struct CREATE_SESSION4args {
+       clientid4               csa_clientid;
+       sequenceid4             csa_sequence;
+       uint32_t                csa_flags;
+       channel_attrs4          csa_fore_chan_attrs;
+       channel_attrs4          csa_back_chan_attrs;
+       uint32_t                csa_cb_program;
+       callback_sec_parms4     csa_sec_parms<>;
+};
+
+struct CREATE_SESSION4resok {
+       sessionid4              csr_sessionid;
+       sequenceid4             csr_sequence;
+       uint32_t                csr_flags;
+       channel_attrs4          csr_fore_chan_attrs;
+       channel_attrs4          csr_back_chan_attrs;
+};
+
+union CREATE_SESSION4res switch (nfsstat4 csr_status) {
+case NFS4_OK:
+       CREATE_SESSION4resok    csr_resok4;
+default:
+       void;
+};
+
+/*
+ * DESTROY_SESSION
+ */
+struct DESTROY_SESSION4args {
+       sessionid4      dsa_sessionid;
+};
+
+struct DESTROY_SESSION4res {
+       nfsstat4        dsr_status;
+};
+
+/*
+ * FREE_STATEID
+ */
+struct FREE_STATEID4args {
+       stateid4        fsa_stateid;
+};
+
+struct FREE_STATEID4res {
+       nfsstat4        fsr_status;
+};
+
+/*
+ * GET_DIR_DELEGATION
+ */
+typedef nfstime4 attr_notice4;
+
+struct GET_DIR_DELEGATION4args {
+       bool            gdda_signal_deleg_avail;
+       bitmap4         gdda_notification_types;
+       attr_notice4    gdda_child_attr_delay;
+       attr_notice4    gdda_dir_attr_delay;
+       bitmap4         gdda_child_attributes;
+       bitmap4         gdda_dir_attributes;
+};
+
+struct GET_DIR_DELEGATION4resok {
+       verifier4       gddr_cookieverf;
+       stateid4        gddr_stateid;
+       bitmap4         gddr_notification;
+       bitmap4         gddr_child_attributes;
+       bitmap4         gddr_dir_attributes;
+};
+
+enum gddrnf4_status {
+       GDD4_OK         = 0,
+       GDD4_UNAVAIL    = 1
+};
+
+union GET_DIR_DELEGATION4res_non_fatal switch (gddrnf4_status gddrnf_status) {
+ case GDD4_OK:
+     GET_DIR_DELEGATION4resok      gddrnf_resok4;
+ case GDD4_UNAVAIL:
+     bool                          gddrnf_will_signal_deleg_avail;
+};
+
+union GET_DIR_DELEGATION4res switch (nfsstat4 gddr_status) {
+ case NFS4_OK:
+     GET_DIR_DELEGATION4res_non_fatal      gddr_res_non_fatal4;
+ default:
+     void;
+};
+
+/*
+ * GETDEVICEINFO
+ */
+struct GETDEVICEINFO4args {
+       deviceid4       gdia_device_id;
+       layouttype4     gdia_layout_type;
+       count4          gdia_maxcount;
+       bitmap4         gdia_notify_types;
+};
+
+struct GETDEVICEINFO4resok {
+       device_addr4    gdir_device_addr;
+       bitmap4         gdir_notification;
+};
+
+union GETDEVICEINFO4res switch (nfsstat4 gdir_status) {
+case NFS4_OK:
+       GETDEVICEINFO4resok     gdir_resok4;
+case NFS4ERR_TOOSMALL:
+       count4                  gdir_mincount;
+default:
+       void;
+};
+
+/*
+ * GETDEVICELIST
+ */
+struct GETDEVICELIST4args {
+        layouttype4     gdla_layout_type;
+        count4          gdla_maxdevices;
+        nfs_cookie4     gdla_cookie;
+        verifier4       gdla_cookieverf;
+};
+
+struct GETDEVICELIST4resok {
+       nfs_cookie4             gdlr_cookie;
+       verifier4               gdlr_cookieverf;
+       deviceid4               gdlr_deviceid_list<>;
+       bool                    gdlr_eof;
+};
+
+union GETDEVICELIST4res switch (nfsstat4 gdlr_status) {
+case NFS4_OK:
+       GETDEVICELIST4resok     gdlr_resok4;
+default:
+       void;
+};
+
+/*
+ * LAYOUTCOMMIT
+ */
+union newtime4 switch (bool nt_timechanged) {
+case TRUE:
+       nfstime4           nt_time;
+case FALSE:
+       void;
+};
+
+union newoffset4 switch (bool no_newoffset) {
+case TRUE:
+       offset4           no_offset;
+case FALSE:
+       void;
+};
+
+struct LAYOUTCOMMIT4args {
+       offset4                 loca_offset;
+       length4                 loca_length;
+       bool                    loca_reclaim;
+       stateid4                loca_stateid;
+       newoffset4              loca_last_write_offset;
+       newtime4                loca_time_modify;
+       layoutupdate4           loca_layoutupdate;
+};
+
+union newsize4 switch (bool ns_sizechanged) {
+case TRUE:
+       length4         ns_size;
+case FALSE:
+       void;
+};
+
+struct LAYOUTCOMMIT4resok {
+       newsize4                locr_newsize;
+};
+
+union LAYOUTCOMMIT4res switch (nfsstat4 locr_status) {
+case NFS4_OK:
+       LAYOUTCOMMIT4resok      locr_resok4;
+default:
+       void;
+};
+
+/*
+ * LAYOUTGET
+ */
+struct LAYOUTGET4args {
+       bool                    loga_signal_layout_avail;
+       layouttype4             loga_layout_type;
+       layoutiomode4           loga_iomode;
+       offset4                 loga_offset;
+       length4                 loga_length;
+       length4                 loga_minlength;
+       stateid4                loga_stateid;
+       count4                  loga_maxcount;
+};
+
+struct LAYOUTGET4resok {
+       bool               logr_return_on_close;
+       stateid4           logr_stateid;
+       layout4            logr_layout<>;
+};
+
+union LAYOUTGET4res switch (nfsstat4 logr_status) {
+case NFS4_OK:
+       LAYOUTGET4resok     logr_resok4;
+case NFS4ERR_LAYOUTTRYLATER:
+       bool                logr_will_signal_layout_avail;
+default:
+       void;
+};
+
+/*
+ * LAYOUTRETURN
+ */
+const LAYOUT4_RET_REC_FILE      = 1;
+const LAYOUT4_RET_REC_FSID      = 2;
+const LAYOUT4_RET_REC_ALL       = 3;
+
+enum layoutreturn_type4 {
+       LAYOUTRETURN4_FILE = LAYOUT4_RET_REC_FILE,
+       LAYOUTRETURN4_FSID = LAYOUT4_RET_REC_FSID,
+       LAYOUTRETURN4_ALL  = LAYOUT4_RET_REC_ALL
+};
+
+struct layoutreturn_file4 {
+       offset4         lrf_offset;
+       length4         lrf_length;
+       stateid4        lrf_stateid;
+       opaque          lrf_body<>;
+};
+
+union layoutreturn4 switch(layoutreturn_type4 lr_returntype) {
+       case LAYOUTRETURN4_FILE:
+               layoutreturn_file4      lr_layout;
+       default:
+               void;
+};
+
+struct LAYOUTRETURN4args {
+       bool                    lora_reclaim;
+       layouttype4             lora_layout_type;
+       layoutiomode4           lora_iomode;
+       layoutreturn4           lora_layoutreturn;
+};
+
+union layoutreturn_stateid switch (bool lrs_present) {
+case TRUE:
+       stateid4                lrs_stateid;
+case FALSE:
+       void;
+};
+
+union LAYOUTRETURN4res switch (nfsstat4 lorr_status) {
+case NFS4_OK:
+       layoutreturn_stateid    lorr_stateid;
+default:
+       void;
+};
+
+/*
+ * SECINFO_NO_NAME
+ */
+enum secinfo_style4 {
+       SECINFO_STYLE4_CURRENT_FH       = 0,
+       SECINFO_STYLE4_PARENT           = 1
+};
+
+typedef secinfo_style4 SECINFO_NO_NAME4args;
+
+typedef SECINFO4res SECINFO_NO_NAME4res;
+
+/*
+ * SEQUENCE
+ */
+struct SEQUENCE4args {
+       sessionid4     sa_sessionid;
+       sequenceid4    sa_sequenceid;
+       slotid4        sa_slotid;
+       slotid4        sa_highest_slotid;
+       bool           sa_cachethis;
+};
+
+const SEQ4_STATUS_CB_PATH_DOWN                  = 0x00000001;
+const SEQ4_STATUS_CB_GSS_CONTEXTS_EXPIRING      = 0x00000002;
+const SEQ4_STATUS_CB_GSS_CONTEXTS_EXPIRED       = 0x00000004;
+const SEQ4_STATUS_EXPIRED_ALL_STATE_REVOKED     = 0x00000008;
+const SEQ4_STATUS_EXPIRED_SOME_STATE_REVOKED    = 0x00000010;
+const SEQ4_STATUS_ADMIN_STATE_REVOKED           = 0x00000020;
+const SEQ4_STATUS_RECALLABLE_STATE_REVOKED      = 0x00000040;
+const SEQ4_STATUS_LEASE_MOVED                   = 0x00000080;
+const SEQ4_STATUS_RESTART_RECLAIM_NEEDED        = 0x00000100;
+const SEQ4_STATUS_CB_PATH_DOWN_SESSION          = 0x00000200;
+const SEQ4_STATUS_BACKCHANNEL_FAULT             = 0x00000400;
+const SEQ4_STATUS_DEVID_CHANGED                 = 0x00000800;
+const SEQ4_STATUS_DEVID_DELETED                 = 0x00001000;
+
+struct SEQUENCE4resok {
+       sessionid4      sr_sessionid;
+       sequenceid4     sr_sequenceid;
+       slotid4         sr_slotid;
+       slotid4         sr_highest_slotid;
+       slotid4         sr_target_highest_slotid;
+       uint32_t        sr_status_flags;
+};
+
+union SEQUENCE4res switch (nfsstat4 sr_status) {
+case NFS4_OK:
+       SEQUENCE4resok  sr_resok4;
+default:
+       void;
+};
+
+/*
+ * SET_SSV
+ */
+struct ssa_digest_input4 {
+       SEQUENCE4args sdi_seqargs;
+};
+
+struct SET_SSV4args {
+       opaque          ssa_ssv<>;
+       opaque          ssa_digest<>;
+};
+
+struct ssr_digest_input4 {
+       SEQUENCE4res sdi_seqres;
+};
+
+struct SET_SSV4resok {
+       opaque          ssr_digest<>;
+};
+
+union SET_SSV4res switch (nfsstat4 ssr_status) {
+case NFS4_OK:
+       SET_SSV4resok   ssr_resok4;
+default:
+       void;
+};
+
+/*
+ * TEST_STATEID
+ */
+struct TEST_STATEID4args {
+       stateid4        ts_stateids<>;
+};
+
+struct TEST_STATEID4resok {
+       nfsstat4        tsr_status_codes<>;
+};
+
+union TEST_STATEID4res switch (nfsstat4 tsr_status) {
+   case NFS4_OK:
+       TEST_STATEID4resok tsr_resok4;
+   default:
+       void;
+};
+
+/*
+ * WANT_DELEGATION
+ */
+union deleg_claim4 switch (open_claim_type4 dc_claim) {
+case CLAIM_FH:
+       void;
+case CLAIM_DELEG_PREV_FH:
+       void;
+case CLAIM_PREVIOUS:
+       open_delegation_type4   dc_delegate_type;
+};
+
+struct WANT_DELEGATION4args {
+       uint32_t        wda_want;
+       deleg_claim4    wda_claim;
+};
+
+union WANT_DELEGATION4res switch (nfsstat4 wdr_status) {
+case NFS4_OK:
+       open_delegation4 wdr_resok4;
+default:
+       void;
+};
+
+/*
+ * DESTROY_CLIENTID
+ */
+struct DESTROY_CLIENTID4args {
+       clientid4       dca_clientid;
+};
+
+struct DESTROY_CLIENTID4res {
+       nfsstat4        dcr_status;
+};
+
+/*
+ * RECLAIM_COMPLETE
+ */
+struct RECLAIM_COMPLETE4args {
+       bool            rca_one_fs;
+};
+
+struct RECLAIM_COMPLETE4res {
+       nfsstat4        rcr_status;
+};
+
+/*
  * ILLEGAL: Response for illegal operation numbers
  */
 struct ILLEGAL4res {
@@ -1454,6 +1933,22 @@ enum nfs_opnum4 {
         OP_VERIFY               = 37,
         OP_WRITE                = 38,
         OP_RELEASE_LOCKOWNER    = 39,
+        OP_CREATE_SESSION       = 43,
+        OP_DESTROY_SESSION      = 44,
+        OP_FREE_STATEID         = 45,
+        OP_GET_DIR_DELEGATION   = 46,
+        OP_GETDEVICEINFO        = 47,
+        OP_GETDEVICELIST        = 48,
+        OP_LAYOUTCOMMIT         = 49,
+        OP_LAYOUTGET            = 50,
+        OP_LAYOUTRETURN         = 51,
+        OP_SECINFO_NO_NAME      = 52,
+        OP_SEQUENCE             = 53,
+        OP_SET_SSV              = 54,
+        OP_TEST_STATEID         = 55,
+        OP_WANT_DELEGATION      = 56,
+        OP_DESTROY_CLIENTID     = 57,
+        OP_RECLAIM_COMPLETE     = 58,
         OP_ILLEGAL              = 10044
 };
 
@@ -1488,9 +1983,7 @@ union nfs_argop4 switch (nfs_opnum4 argop) {
  case OP_RENEW:         RENEW4args oprenew;
  case OP_RESTOREFH:     void;
  case OP_SAVEFH:        void;
-#if 0
  case OP_SECINFO:       SECINFO4args opsecinfo;
-#endif
  case OP_SETATTR:       SETATTR4args opsetattr;
  case OP_SETCLIENTID:   SETCLIENTID4args opsetclientid;
  case OP_SETCLIENTID_CONFIRM:   SETCLIENTID_CONFIRM4args
@@ -1499,6 +1992,22 @@ union nfs_argop4 switch (nfs_opnum4 argop) {
  case OP_WRITE:         WRITE4args opwrite;
  case OP_RELEASE_LOCKOWNER:     RELEASE_LOCKOWNER4args
                                     oprelease_lockowner;
+ case OP_CREATE_SESSION:        CREATE_SESSION4args opcreatesession;
+ case OP_DESTROY_SESSION:       DESTROY_SESSION4args opdestroysession;
+ case OP_FREE_STATEID:          FREE_STATEID4args opfreestateid;
+ case OP_GET_DIR_DELEGATION:    GET_DIR_DELEGATION4args opgetdirdelegation;
+ case OP_GETDEVICEINFO:         GETDEVICEINFO4args opgetdeviceinfo;
+ case OP_GETDEVICELIST:         GETDEVICELIST4args opgetdevicelist;
+ case OP_LAYOUTCOMMIT:          LAYOUTCOMMIT4args oplayoutcommit;
+ case OP_LAYOUTGET:             LAYOUTGET4args oplayoutget;
+ case OP_LAYOUTRETURN:          LAYOUTRETURN4args oplayoutreturn;
+ case OP_SECINFO_NO_NAME:       SECINFO_NO_NAME4args opsecinfononame;
+ case OP_SEQUENCE:              SEQUENCE4args opsequence;
+ case OP_SET_SSV:               SET_SSV4args opsetssv;
+ case OP_TEST_STATEID:          TEST_STATEID4args opteststateid;
+ case OP_WANT_DELEGATION:       WANT_DELEGATION4args opwantdelegation;
+ case OP_DESTROY_CLIENTID:      DESTROY_CLIENTID4args opdestroyclientid;
+ case OP_RECLAIM_COMPLETE:      RECLAIM_COMPLETE4args opreclaimcomplete;
  case OP_ILLEGAL:       void;
 };
 
@@ -1533,9 +2042,7 @@ union nfs_resop4 switch (nfs_opnum4 resop){
  case OP_RENEW:         RENEW4res oprenew;
  case OP_RESTOREFH:     RESTOREFH4res oprestorefh;
  case OP_SAVEFH:        SAVEFH4res opsavefh;
-#if 0
  case OP_SECINFO:       SECINFO4res opsecinfo;
-#endif
  case OP_SETATTR:       SETATTR4res opsetattr;
  case OP_SETCLIENTID:   SETCLIENTID4res opsetclientid;
  case OP_SETCLIENTID_CONFIRM:   SETCLIENTID_CONFIRM4res
@@ -1544,6 +2051,22 @@ union nfs_resop4 switch (nfs_opnum4 resop){
  case OP_WRITE:         WRITE4res opwrite;
  case OP_RELEASE_LOCKOWNER:     RELEASE_LOCKOWNER4res
                                     oprelease_lockowner;
+ case OP_CREATE_SESSION:        CREATE_SESSION4res opcreatesession;
+ case OP_DESTROY_SESSION:       DESTROY_SESSION4res opdestroysession;
+ case OP_FREE_STATEID:          FREE_STATEID4res opfreestateid;
+ case OP_GET_DIR_DELEGATION:    GET_DIR_DELEGATION4res opgetdirdelegation;
+ case OP_GETDEVICEINFO:         GETDEVICEINFO4res opgetdeviceinfo;
+ case OP_GETDEVICELIST:         GETDEVICELIST4res opgetdevicelist;
+ case OP_LAYOUTCOMMIT:          LAYOUTCOMMIT4res oplayoutcommit;
+ case OP_LAYOUTGET:             LAYOUTGET4res oplayoutget;
+ case OP_LAYOUTRETURN:          LAYOUTRETURN4res oplayoutreturn;
+ case OP_SECINFO_NO_NAME:       SECINFO_NO_NAME4res opsecinfononame;
+ case OP_SEQUENCE:              SEQUENCE4res opsequence;
+ case OP_SET_SSV:               SET_SSV4res opsetssv;
+ case OP_TEST_STATEID:          TEST_STATEID4res opteststateid;
+ case OP_WANT_DELEGATION:       WANT_DELEGATION4res opwantdelegation;
+ case OP_DESTROY_CLIENTID:      DESTROY_CLIENTID4res opdestroyclientid;
+ case OP_RECLAIM_COMPLETE:      RECLAIM_COMPLETE4res opreclaimcomplete;
  case OP_ILLEGAL:       ILLEGAL4res opillegal;
 };
 

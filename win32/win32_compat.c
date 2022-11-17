@@ -26,7 +26,7 @@ THE SOFTWARE.
 static int dummy _U_;
 
 #else
-#include "win32_compat.h"
+#include <win32/win32_compat.h>
 #include <errno.h>
 #include <stdio.h>
 
@@ -50,7 +50,7 @@ int win32_inet_pton(int af, const char * src, void * dst)
   struct sockaddr_in sa;
   int len = sizeof(SOCKADDR);
   int ret = -1;
-  int strLen = strlen(src) + 1;
+  size_t strLen = strlen(src) + 1;
 #ifdef UNICODE
   wchar_t *srcNonConst = (wchar_t *)malloc(strLen*sizeof(wchar_t));
   memset(srcNonConst, 0, strLen);
@@ -132,7 +132,7 @@ int win32_poll(struct pollfd *fds, unsigned int nfds, int timo)
   {
     for (i = 0; i < nfds; ++i) 
     {
-      int fd = fds[i].fd;
+      SOCKET fd = fds[i].fd;
       if(fds[i].events & (POLLIN|POLLPRI) && FD_ISSET(fd, &ifds))
         fds[i].revents |= POLLIN;
       if(fds[i].events & POLLOUT && FD_ISSET(fd, &ofds))
@@ -197,6 +197,23 @@ int win32_gettimeofday(struct timeval *tv, struct timezone *tz)
  
   return 0;
 }
-
 #endif
+
+#ifdef __MINGW32__
+char* strndup(const char* s, size_t n)
+{
+  size_t len;
+  for(len=0; len<n && s[len]; len++);
+  len += 1;
+  if(!len)
+    return 0;
+  char* copy = malloc(len);
+  if(!copy)
+    return 0;
+  memcpy(copy, s, len-1);
+  copy[len-1] = 0;
+  return copy;
+}
+#endif
+
 #endif

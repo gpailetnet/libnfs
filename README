@@ -25,9 +25,9 @@ examples/nfsclient-sync.c provides examples on how to use this API
 
 NFSv4:
 ======
-NFSv4 is supported but only for the RAW ASYNC interface.
-Examples/nfsv4-cat.c is a "simple" example to illustrate how to use
-NFSv4 to connect to a server and read a file off the server.
+NFSv3 is the default but NFSv4 can be selected either by using the URL argument
+version=4 or programatically calling nfs_set_version(nfs, NFS_V4) before
+connecting to the server/share.
 
 SERVER SUPPORT:
 ===============
@@ -40,7 +40,17 @@ URL-FORMAT:
 Libnfs uses RFC2224 style URLs extended with some minor libnfs extensions.
 The basic syntax of these URLs is :
 
-nfs://<server|ipv4|ipv6>/path[?arg=val[&arg=val]*]
+nfs://<server|ipv4|ipv6>[:<port>]/path[?arg=val[&arg=val]*]
+
+Special characters in 'path' are escaped using %-hex-hex syntax.
+
+For example '?' must be escaped if it occurs in a path as '?' is also used to
+separate the path from the optional list of url arguments.
+
+Example:
+nfs://127.0.0.1/my?path/?version=4
+must be escaped as
+nfs://127.0.0.1/my%3Fpath/?version=4
 
 Arguments supported by libnfs are :
  tcp-syncnt=<int>  : Number of SYNs to send during the session establish
@@ -56,7 +66,21 @@ Arguments supported by libnfs are :
                    : Should libnfs try to traverse across nested mounts
                      automatically or not. Default is 1 == enabled.
  dircache=<0|1>    : Disable/enable directory caching. Enabled by default.
+ autoreconnect=<-1|0|>=1>
+                   : Control the auto-reconnect behaviour to the NFS session.
+                    -1 : Try to reconnect forever on session failures.
+                         Just like normal NFS clients do.
+                     0 : Disable auto-reconnect completely and immediately
+                         return a failure to the application.
+                   >=1 : Retry to connect back to the server this many
+                         times before failing and returing an error back
+                         to the application.
  if=<interface>    : Interface name (e.g., eth1) to bind; requires `root`
+ version=<3|4>     : NFS Version. Default is 3.
+ nfsport=<port>    : Use this port for NFS instead of using the portmapper.
+ mountport=<port>  : Use this port for the MOUNT protocol instead of
+                     using portmapper. This argument is ignored for NFSv4
+                     as it does not use the MOUNT protocol.
 
 Auto_traverse_mounts
 ====================
@@ -122,6 +146,8 @@ Windows:- tested on Windows 7 64 and Windows XP 32 using Visual Studio 10 (see R
         - tested on Windows 7 64 using MingW on Linux to cross-compile (Debian and Ubuntu tested)
 Android:- tested with NDK r10e - running on Android 4.4 (should work starting from 2.3.3)
 AROS: - Build with 'make -f aros/Makefile.AROS'
+Playstation 2: - Build and install with 'cd ps2ee; make -f Makefile.PS2_EE install'
+PlayStation 3: - Build and install the library with 'make -f ps3_ppu/Makefile.PS3_PPU install'
 
 
 LD_PRELOAD
@@ -138,6 +164,11 @@ Then try things like
 LD_NFS_DEBUG=9 LD_PRELOAD=./ld_nfs.so cat nfs://127.0.0.1/data/tmp/foo123
 
 LD_NFS_DEBUG=9 LD_PRELOAD=./ld_nfs.so cp nfs://127.0.0.1/data/tmp/foo123 nfs://127.0.0.1/data/tmp/foo123.copy
+
+LD_NFS_UID and LD_NFS_GID can be used to fake the uid andthe gid in the nfs context.
+This can be useful on "insecure" enabled NFS share to make the server trust you as a root.
+You can try to run as a normal user things like :
+LD_NFS_DEBUG=9 LD_NFS_UID=0 LD_NFS_GID=0 LD_PRELOAD=./ld_nfs.so chown root:root nfs://127.0.0.1/data/tmp/foo123
 
 This is just a toy preload module. Don't open bugs if it does not work. Send
 patches to make it better instead.

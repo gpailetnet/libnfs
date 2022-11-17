@@ -34,6 +34,7 @@
 #define CADDR_T_DEFINED
 typedef char *caddr_t;
 #endif
+#include <winsock2.h>
 #endif
 
 #include <stdio.h>
@@ -92,7 +93,9 @@ struct ZDR {
 typedef struct ZDR ZDR;
 
 
+#ifdef __MINGW32__
 typedef uint32_t u_int;
+#endif
 typedef uint32_t enum_t;
 typedef uint32_t bool_t;
 
@@ -100,6 +103,7 @@ typedef uint32_t (*zdrproc_t) (ZDR *, void *,...);
 
 #define AUTH_NONE 0
 #define AUTH_NULL 0
+#define AUTH_SYS  1
 #define AUTH_UNIX 1
 
 struct opaque_auth {

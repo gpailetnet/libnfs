@@ -1,3 +1,4 @@
+/* -*-  mode:c; tab-width:8; c-basic-offset:8; indent-tabs-mode:nil;  -*- */
 /*
    Copyright (C) 2010 by Ronnie Sahlberg <ronniesahlberg@gmail.com>
 
@@ -22,8 +23,16 @@
 #include "aros_compat.h"
 #endif
 
+#ifdef PS2_EE
+#include "ps2_compat.h"
+#endif
+
+#ifdef PS3_PPU
+#include "ps3_compat.h"
+#endif
+
 #ifdef WIN32
-#include "win32_compat.h"
+#include <win32/win32_compat.h>
 #endif
 
 #ifndef _GNU_SOURCE
@@ -50,11 +59,52 @@
 #include "libnfs-raw.h"
 #include "libnfs-private.h"
 
+uint64_t rpc_current_time(void)
+{
+#ifdef HAVE_CLOCK_GETTIME
+	struct timespec tp;
+
+	clock_gettime(CLOCK_MONOTONIC_COARSE, &tp);
+	return (uint64_t)tp.tv_sec * 1000 + tp.tv_nsec / 1000000;
+#else
+	return (uint64_t)time(NULL) * 1000;
+#endif
+}
+
+int rpc_set_hash_size(struct rpc_context *rpc, int hashes)
+{
+	uint32_t i;
+
+#ifdef HAVE_MULTITHREADING
+        if (rpc->multithreading_enabled) {
+                nfs_mt_mutex_lock(&rpc->rpc_mutex);
+        }
+#endif /* HAVE_MULTITHREADING */
+        rpc->num_hashes = hashes;
+        free(rpc->waitpdu);
+	rpc->waitpdu = malloc(sizeof(struct rpc_queue) * rpc->num_hashes);
+        if (rpc->waitpdu == NULL) {
+                return -1;
+        }
+	for (i = 0; i < rpc->num_hashes; i++)
+		rpc_reset_queue(&rpc->waitpdu[i]);
+#ifdef HAVE_MULTITHREADING
+        if (rpc->multithreading_enabled) {
+                nfs_mt_mutex_unlock(&rpc->rpc_mutex);
+        }
+#endif /* HAVE_MULTITHREADING */
+        return 0;
+}
+
+int nfs_set_hash_size(struct nfs_context *nfs, int hashes)
+{
+        return rpc_set_hash_size(nfs->rpc, hashes);
+}
+
 struct rpc_context *rpc_init_context(void)
 {
 	struct rpc_context *rpc;
 	static uint32_t salt = 0;
-	unsigned int i;
 
 	rpc = malloc(sizeof(struct rpc_context));
 	if (rpc == NULL) {
@@ -62,19 +112,31 @@ struct rpc_context *rpc_init_context(void)
 	}
 	memset(rpc, 0, sizeof(struct rpc_context));
 
+	if (rpc_set_hash_size(rpc, DEFAULT_HASHES)) {
+                free(rpc);
+		return NULL;
+	}
+        
 	rpc->magic = RPC_CONTEXT_MAGIC;
+
+#ifdef HAVE_MULTITHREADING
+	nfs_mt_mutex_init(&rpc->rpc_mutex);
+#endif /* HAVE_MULTITHREADING */
 
  	rpc->auth = authunix_create_default();
 	if (rpc->auth == NULL) {
+		free(rpc->waitpdu);
 		free(rpc);
 		return NULL;
 	}
-	rpc->xid = salt + time(NULL) + (getpid() << 16);
+	// Add PID to rpc->xid for easier debugging, making sure to cast
+	// pid to 32-bit type to avoid invalid left-shifts.
+	rpc->xid = salt + (uint32_t)rpc_current_time() + ((uint32_t)getpid() << 16);
 	salt += 0x01000000;
 	rpc->fd = -1;
 	rpc->tcp_syncnt = RPC_PARAM_UNDEFINED;
 	rpc->pagecache_ttl = NFS_PAGECACHE_DEFAULT_TTL;
-#if defined(WIN32) || defined(ANDROID)
+#if defined(WIN32) || defined(ANDROID) || defined(PS3_PPU)
 	rpc->uid = 65534;
 	rpc->gid = 65534;
 #else
@@ -82,8 +144,6 @@ struct rpc_context *rpc_init_context(void)
 	rpc->gid = getgid();
 #endif
 	rpc_reset_queue(&rpc->outqueue);
-	for (i = 0; i < HASHES; i++)
-		rpc_reset_queue(&rpc->waitpdu[i]);
 
 	/* Default is no timeout */
 	rpc->timeout = -1;
@@ -109,6 +169,9 @@ struct rpc_context *rpc_init_server_context(int s)
         rpc->is_udp = rpc_is_udp_socket(rpc);
 	rpc_reset_queue(&rpc->outqueue);
 
+#ifdef HAVE_MULTITHREADING
+        nfs_mt_mutex_init(&rpc->rpc_mutex);
+#endif /* HAVE_MULTITHREADING */
 	return rpc;
 }
 
@@ -224,13 +287,24 @@ void rpc_set_gid(struct rpc_context *rpc, int gid) {
 	rpc_set_uid_gid(rpc, rpc->uid, gid);
 }
 
+void rpc_set_auxiliary_gids(struct rpc_context *rpc, uint32_t len, uint32_t* gids) {
+	struct AUTH *auth = libnfs_authunix_create("libnfs", rpc->uid, rpc->gid, len, gids);
+	if (auth != NULL) {
+		rpc_set_auth(rpc, auth);
+	}
+}
+
 void rpc_set_error(struct rpc_context *rpc, const char *error_string, ...)
 {
         va_list ap;
-	char *old_error_string = rpc->error_string;
+	char *old_error_string;
 
-	assert(rpc->magic == RPC_CONTEXT_MAGIC);
-
+#ifdef HAVE_MULTITHREADING
+        if (rpc->multithreading_enabled) {
+                nfs_mt_mutex_lock(&rpc->rpc_mutex);
+        }
+#endif /* HAVE_MULTITHREADING */
+        old_error_string = rpc->error_string;
         va_start(ap, error_string);
 	rpc->error_string = malloc(1024);
 	vsnprintf(rpc->error_string, 1024, error_string, ap);
@@ -241,41 +315,84 @@ void rpc_set_error(struct rpc_context *rpc, const char *error_string, ...)
 	if (old_error_string != NULL) {
 		free(old_error_string);
 	}
+#ifdef HAVE_MULTITHREADING
+        if (rpc->multithreading_enabled) {
+                nfs_mt_mutex_unlock(&rpc->rpc_mutex);
+        }
+#endif /* HAVE_MULTITHREADING */
 }
 
 char *rpc_get_error(struct rpc_context *rpc)
 {
 	assert(rpc->magic == RPC_CONTEXT_MAGIC);
 
-	return rpc->error_string;
+	return rpc->error_string ? rpc->error_string : "";
+}
+
+static void rpc_purge_all_pdus(struct rpc_context *rpc, int status, const char *error)
+{
+	struct rpc_queue outqueue;
+	struct rpc_pdu *pdu;
+	int i;
+
+	assert(rpc->magic == RPC_CONTEXT_MAGIC);
+
+	/* Remove all entries from each queue before cancellation to prevent
+	 * the callbacks manipulating entries that are about to be removed.
+	 *
+	 * This code assumes that the callbacks will not enqueue any new
+	 * pdus when called.
+	 */
+
+#ifdef HAVE_MULTITHREADING
+        if (rpc->multithreading_enabled) {
+                nfs_mt_mutex_lock(&rpc->rpc_mutex);
+        }
+#endif /* HAVE_MULTITHREADING */
+	outqueue = rpc->outqueue;
+
+	rpc_reset_queue(&rpc->outqueue);
+	while ((pdu = outqueue.head) != NULL) {
+		outqueue.head = pdu->next;
+                pdu->next = NULL;
+		pdu->cb(rpc, status, (void *) error, pdu->private_data);
+		rpc_free_pdu(rpc, pdu);
+	}
+#ifdef HAVE_MULTITHREADING
+        if (rpc->multithreading_enabled) {
+                nfs_mt_mutex_unlock(&rpc->rpc_mutex);
+        }
+#endif /* HAVE_MULTITHREADING */
+
+	for (i = 0; i < rpc->num_hashes; i++) {
+		struct rpc_queue waitqueue;
+
+#ifdef HAVE_MULTITHREADING
+                if (rpc->multithreading_enabled) {
+                        nfs_mt_mutex_lock(&rpc->rpc_mutex);
+                }
+#endif /* HAVE_MULTITHREADING */
+		waitqueue = rpc->waitpdu[i];
+		rpc_reset_queue(&rpc->waitpdu[i]);
+#ifdef HAVE_MULTITHREADING
+                if (rpc->multithreading_enabled) {
+                        nfs_mt_mutex_unlock(&rpc->rpc_mutex);
+                }
+#endif /* HAVE_MULTITHREADING */
+		while((pdu = waitqueue.head) != NULL) {
+			waitqueue.head = pdu->next;
+			pdu->next = NULL;
+			pdu->cb(rpc, status, (void *) error, pdu->private_data);
+			rpc_free_pdu(rpc, pdu);
+		}
+	}
+
+	assert(!rpc->outqueue.head);
 }
 
 void rpc_error_all_pdus(struct rpc_context *rpc, const char *error)
 {
-	struct rpc_pdu *pdu;
-	unsigned int i;
-
-	assert(rpc->magic == RPC_CONTEXT_MAGIC);
-
-	while ((pdu = rpc->outqueue.head) != NULL) {
-		rpc->outqueue.head = pdu->next;
-          pdu->cb(rpc, RPC_STATUS_ERROR, (void *)error, pdu->private_data);
-		rpc_free_pdu(rpc, pdu);
-	}
-	rpc->outqueue.tail = NULL;
-
-	for (i = 0; i < HASHES; i++) {
-		struct rpc_queue *q = &rpc->waitpdu[i];
-
-		while((pdu = q->head) != NULL) {
-			q->head = pdu->next;
-                  pdu->cb(rpc, RPC_STATUS_ERROR, (void *)error,
-                          pdu->private_data);
-			rpc_free_pdu(rpc, pdu);
-		}
-		q->tail = NULL;
-	}
-	rpc->waitpdu_len = 0;
+	rpc_purge_all_pdus(rpc, RPC_STATUS_ERROR, error);
 }
 
 static void rpc_free_fragment(struct rpc_fragment *fragment)
@@ -323,34 +440,9 @@ int rpc_add_fragment(struct rpc_context *rpc, char *data, uint32_t size)
 
 void rpc_destroy_context(struct rpc_context *rpc)
 {
-	struct rpc_pdu *pdu;
-	unsigned int i;
-
 	assert(rpc->magic == RPC_CONTEXT_MAGIC);
 
-        /* If we are a server context, free all registered endpoints. */
-        while (rpc->endpoints != NULL) {
-                struct rpc_endpoint *next = rpc->endpoints->next;
-
-                free(rpc->endpoints);
-                rpc->endpoints = next;
-        }
-
-	while((pdu = rpc->outqueue.head) != NULL) {
-		LIBNFS_LIST_REMOVE(&rpc->outqueue.head, pdu);
-		pdu->cb(rpc, RPC_STATUS_CANCEL, NULL, pdu->private_data);
-		rpc_free_pdu(rpc, pdu);
-	}
-
-	for (i = 0; i < HASHES; i++) {
-		struct rpc_queue *q = &rpc->waitpdu[i];
-
-		while((pdu = q->head) != NULL) {
-			LIBNFS_LIST_REMOVE(&q->head, pdu);
-			pdu->cb(rpc, RPC_STATUS_CANCEL, NULL, pdu->private_data);
-			rpc_free_pdu(rpc, pdu);
-		}
-	}
+	rpc_purge_all_pdus(rpc, RPC_STATUS_CANCEL, NULL);
 
 	rpc_free_all_fragments(rpc);
 
@@ -368,7 +460,15 @@ void rpc_destroy_context(struct rpc_context *rpc)
 		rpc->error_string = NULL;
 	}
 
+        free(rpc->waitpdu);
+        rpc->waitpdu = NULL;
+	free(rpc->inbuf);
+	rpc->inbuf = NULL;
+
 	rpc->magic = 0;
+#ifdef HAVE_MULTITHREADING
+        nfs_mt_mutex_destroy(&rpc->rpc_mutex);
+#endif /* HAVE_MULTITHREADING */
 	free(rpc);
 }
 

@@ -27,7 +27,7 @@
 #endif
  
 #ifdef WIN32
-#include "win32_compat.h"
+#include <win32/win32_compat.h>
 #pragma comment(lib, "ws2_32.lib")
 WSADATA wsaData;
 #define PRId64 "ll"
@@ -35,6 +35,7 @@ WSADATA wsaData;
 #include <inttypes.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/statvfs.h>
 #ifndef AROS
 #include <sys/statvfs.h>
@@ -51,21 +52,47 @@ WSADATA wsaData;
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include "libnfs.h"
-#include "libnfs-raw.h"
-#include "libnfs-raw-mount.h"
+#include "../include/nfsc/libnfs.h"
+#include "../include/nfsc/libnfs-raw.h"
+#include "../mount/libnfs-raw-mount.h"
+#include "../nfs/libnfs-raw-nfs.h"
+#include "../nfs4/libnfs-raw-nfs4.h"
 
 void print_usage(void)
 {
-	fprintf(stderr, "Usage: nfs-io [-?|--help|--usage] [stat|creat|trunc|unlink|mkdir|rmdir] <url>\n");
+	fprintf(stderr, "Usage: nfs-io [-?|--help|--usage] [stat|creat|trunc|unlink|mkdir|rmdir|touch|chmod] <url>\n");
 }
 
+
+static char *acl3_type(int type)
+{
+	switch(type) {
+	case NFSACL_TYPE_USER_OBJ: return "USER_OBJ";
+	case NFSACL_TYPE_USER: return "USER";
+	case NFSACL_TYPE_GROUP_OBJ: return "GROUP_OBJ";
+	case NFSACL_TYPE_GROUP: return "GROUP";
+	case NFSACL_TYPE_CLASS_OBJ: return "CLASS_OBJ";
+	case NFSACL_TYPE_CLASS: return "CLASS";
+	case NFSACL_TYPE_DEFAULT: return "DEFAULT";
+	case NFSACL_TYPE_DEFAULT_USER_OBJ: return "DEFAULT_USER_OBJ";
+	case NFSACL_TYPE_DEFAULT_USER: return "DEFAULT_USER";
+	case NFSACL_TYPE_DEFAULT_GROUP_OBJ: return "DEFAULT_GROUP_OBJ";
+	case NFSACL_TYPE_DEFAULT_GROUP: return "DEFAULT_GROUP";
+	case NFSACL_TYPE_DEFAULT_CLASS_OBJ: return "DEFAULT_CLASS_OBJ";
+	case NFSACL_TYPE_DEFAULT_OTHER_OBJ: return "DEFAULT_OTHER_OBJ";
+	}
+	return "Unknown ACE type";
+}
+    
 int main(int argc, char *argv[])
 {
 	int ret = 1;
 	struct nfs_context *nfs = NULL;
 	struct nfsfh *nfsfh = NULL;
 	struct nfs_url *url = NULL;
+	fattr4_acl acl4;
+	fattr3_acl acl3;
+	int i;
 
 #ifdef WIN32
 	if (WSAStartup(MAKEWORD(2,2), &wsaData) != 0) {
@@ -110,6 +137,26 @@ int main(int argc, char *argv[])
 		ret = nfs_rmdir(nfs, url->file);
 	} else if (!strncmp(argv[1], "trunc", 5)) {
 		ret = nfs_truncate(nfs, url->file, 0);
+	} else if (!strncmp(argv[1], "touch", 5)) {
+		struct timeval times[2];
+		gettimeofday(&times[0], NULL);
+		gettimeofday(&times[1], NULL);
+		ret = nfs_utimes(nfs, url->file, times);
+	} else if (!strncmp(argv[1], "chmod", 5)) {
+		if (argc < 4) {
+			fprintf(stderr, "Invalid arguments for chmod");
+			goto finished;
+		}
+		int mode = strtol(argv[2], NULL, 8);
+		ret = nfs_chmod(nfs, url->file, mode);
+	} else if (!strncmp(argv[1], "chown", 5)) {
+		if (argc < 5) {
+			fprintf(stderr, "Invalid arguments for chown");
+			goto finished;
+		}
+		int uid = strtol(argv[2], NULL, 10);
+		int gid = strtol(argv[3], NULL, 10);
+		ret = nfs_chown(nfs, url->file, uid, gid);
 	} else if (!strncmp(argv[1], "stat", 4)) {
 		struct nfs_stat_64 st;
 		ret = nfs_stat64(nfs, url->file, &st);
@@ -136,24 +183,70 @@ int main(int argc, char *argv[])
 			printf("%c%c%c",
 			       "-r"[!!(st.nfs_mode & S_IRUSR)],
 			       "-w"[!!(st.nfs_mode & S_IWUSR)],
-			       "-x"[!!(st.nfs_mode & S_IXUSR)]
-			);
+			       "-xSs"[  !!(st.nfs_mode & S_IXUSR) +
+				      2*!!(st.nfs_mode & S_ISUID)]
+			       );
 			printf("%c%c%c",
 			       "-r"[!!(st.nfs_mode & S_IRGRP)],
 			       "-w"[!!(st.nfs_mode & S_IWGRP)],
-			       "-x"[!!(st.nfs_mode & S_IXGRP)]
+			       "-xSs"[  !!(st.nfs_mode & S_IXGRP) +
+				      2*!!(st.nfs_mode & S_ISGID)]
 			);
 			printf("%c%c%c",
 			       "-r"[!!(st.nfs_mode & S_IROTH)],
 			       "-w"[!!(st.nfs_mode & S_IWOTH)],
-			       "-x"[!!(st.nfs_mode & S_IXOTH)]
+			       "-xTt"[  !!(st.nfs_mode & S_IXOTH) +
+				      2*!!(st.nfs_mode & S_ISVTX)]
 			);
 			printf(" %2d", (int)st.nfs_nlink);
 			printf(" %5d", (int)st.nfs_uid);
 			printf(" %5d", (int)st.nfs_gid);
-			printf(" %12" PRId64, st.nfs_size);
+			printf(" size: %12" PRId64, st.nfs_size);
+			printf(" mtime: %lu %lu", st.nfs_mtime, st.nfs_mtime_nsec);
 			printf("\n");
 		}
+	} else if (!strncmp(argv[1], "acl", 3)) {
+		ret = nfs_open(nfs, url->file, 0600, &nfsfh);
+		if (ret != 0) {
+			printf("failed to open %s. %s\n", url->file, nfs_get_error(nfs));
+			goto finished;
+		}
+
+		printf("ACL version:%d\n", nfs_get_version(nfs));
+		
+		if (nfs_get_version(nfs) == NFS_V3) {
+			printf("Get v3 ACL\n");
+			memset(&acl3, 0, sizeof(fattr3_acl));
+			if (nfs3_getacl(nfs, nfsfh, &acl3) != 0) {
+				printf("nfs3_getacl_async failed\n");
+			}
+			printf("Number of ACEs: %d\n", acl3.ace_count);
+			for (i = 0; i < acl3.ace_count; i++) {
+				printf("%s(%d) ", acl3_type(acl3.ace[i].type), acl3.ace[i].type);
+				printf("Id: %d ", acl3.ace[i].id);
+				printf("Perm: 0x%x: %s%s%s\n", acl3.ace[i].perm,
+				       acl3.ace[i].perm & NFSACL_PERM_READ ? "READ ":"",
+				       acl3.ace[i].perm & NFSACL_PERM_WRITE ? "WRITE ":"",
+				       acl3.ace[i].perm & NFSACL_PERM_EXEC ? "EXEC ":"");
+			}
+			nfs3_acl_free(&acl3);
+			goto finished;
+		}
+
+		/* NFS_V4 */
+		if (nfs4_getacl(nfs, nfsfh, &acl4)) {
+			printf("Failed to read ACLs %s\n", nfs_get_error(nfs));
+			goto finished;
+		}
+		for (i = 0; i < acl4.fattr4_acl_len; i++) {
+			printf("Type:%d Flag:%d Mask:0x%08x Who:%s\n",
+			       acl4.fattr4_acl_val[i].type,
+			       acl4.fattr4_acl_val[i].flag,
+			       acl4.fattr4_acl_val[i].access_mask,
+			       acl4.fattr4_acl_val[i].who.utf8string_val);
+		}
+		nfs4_acl_free(&acl4);
+		ret = 0;
 	} else {
 		goto finished;
 	}

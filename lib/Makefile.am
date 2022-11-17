@@ -19,13 +19,16 @@ libnfs_la_SOURCES = \
 	libnfs.c \
 	libnfs-sync.c \
 	libnfs-zdr.c \
+	multithreading.c \
+	nfs_v3.c \
+	nfs_v4.c \
 	pdu.c \
 	socket.c \
 	../win32/win32_compat.c
 
-SOCURRENT=10
+SOCURRENT=14
 SOREVISION=0
-SOAGE=2
+SOAGE=0
 libnfs_la_LDFLAGS = -version-info $(SOCURRENT):$(SOREVISION):$(SOAGE)
 libnfs_la_LIBADD = \
 	../mount/libmount.la \

@@ -1,3 +1,4 @@
+/* -*-  mode:c; tab-width:8; c-basic-offset:8; indent-tabs-mode:nil;  -*- */
 /*
    Copyright (C) 2010 by Ronnie Sahlberg <ronniesahlberg@gmail.com>
 
@@ -25,8 +26,16 @@
 #include "aros_compat.h"
 #endif
 
+#ifdef PS2_EE
+#include "ps2_compat.h"
+#endif
+
+#ifdef PS3_PPU
+#include "ps3_compat.h"
+#endif
+
 #ifdef WIN32
-#include "win32_compat.h"
+#include <win32/win32_compat.h>
 #endif
 
 #ifdef HAVE_SYS_SOCKET_H
@@ -95,6 +104,7 @@
 #include "libnfs-raw.h"
 #include "libnfs-raw-mount.h"
 #include "libnfs-raw-nfs.h"
+#include "libnfs-raw-nfs4.h"
 #include "libnfs-private.h"
 
 struct sync_cb_data {
@@ -104,69 +114,176 @@ struct sync_cb_data {
 	void *return_data;
 	int return_int;
 	const char *call;
+#ifdef HAVE_MULTITHREADING
+        int has_sem;
+        libnfs_sem_t wait_sem;
+#endif /* HAVE_MULTITHREADING */
 };
 
+static inline int
+nfs_init_cb_data(struct nfs_context **nfs, struct sync_cb_data *cb_data)
+{
+	cb_data->is_finished = 0;
+#ifdef HAVE_MULTITHREADING
+        if (nfs && (*nfs)->rpc->multithreading_enabled && (*nfs)->master_ctx == NULL) {
+                struct nfs_thread_context *ntc;
 
-static void wait_for_reply(struct rpc_context *rpc, struct sync_cb_data *cb_data)
+                for(ntc = (*nfs)->nfsi->thread_ctx; ntc; ntc = ntc->next) {
+                        if (nfs_mt_get_tid() == ntc->tid) {
+                                break;
+                        }
+                }
+                if (ntc) {
+                        *nfs = &ntc->nfs;
+                } else {
+                        ntc = calloc(1, sizeof(struct nfs_thread_context));
+                        if (ntc == NULL) {
+                                return -1;
+                        }
+                        nfs_mt_mutex_lock(&(*nfs)->rpc->rpc_mutex);
+                        ntc->next = (*nfs)->nfsi->thread_ctx;
+                        ntc->tid = nfs_mt_get_tid();
+                        (*nfs)->nfsi->thread_ctx = ntc;
+                        nfs_mt_mutex_unlock(&(*nfs)->rpc->rpc_mutex);
+                        memcpy(&ntc->nfs, *nfs, sizeof(struct nfs_context));
+                        ntc->nfs.error_string = NULL;
+                        ntc->nfs.master_ctx = *nfs;
+
+                        *nfs = &ntc->nfs;
+                }
+        }
+
+        /*
+         * Create a semaphore and initialize it to zero. So that we
+         * can wait for it and immetiately block until the service thread
+         * has received the reply.
+         */
+        if (nfs_mt_sem_init(&cb_data->wait_sem, 0)) {
+                if (nfs && *nfs) {
+                        nfs_set_error(*nfs, "Failed to initialize semaphore");
+                }
+                return -1;
+        }
+        cb_data->has_sem = 1;
+#endif /* HAVE_MULTITHREADING */
+        return 0;
+}
+
+static inline void
+nfs_destroy_cb_sem(struct sync_cb_data *cb_data)
+{
+#ifdef HAVE_MULTITHREADING
+        if (cb_data->has_sem) {
+                nfs_mt_sem_destroy(&cb_data->wait_sem);
+        }
+        cb_data->has_sem = 0;
+#endif
+}        
+
+static inline void
+cb_data_is_finished(struct sync_cb_data *cb_data, int status)
+{
+        cb_data->is_finished = 1;
+	cb_data->status = status;
+#ifdef HAVE_MULTITHREADING
+        if (cb_data->has_sem) {
+                nfs_mt_sem_post(&cb_data->wait_sem);
+        }
+#endif
+}
+
+static void
+wait_for_reply(struct rpc_context *rpc, struct sync_cb_data *cb_data)
 {
 	struct pollfd pfd;
+	int revents;
 	int ret;
+	uint64_t timeout;
 
 	assert(rpc->magic == RPC_CONTEXT_MAGIC);
 
+	if (rpc->timeout > 0) {
+		timeout = rpc_current_time() + rpc->timeout;
+#ifndef HAVE_CLOCK_GETTIME
+		/* If we do not have GETTIME we fallback to time() which
+		 * has 1s granularity for its timestamps.
+		 * We thus need to bump the timeout by 1000ms
+		 * so that we break if timeout is within 1.0 - 2.0 seconds.
+		 * Otherwise setting a 1s timeout would trigger within
+		 * 0.001 - 1.0s.
+		 */
+		timeout += 1000;
+#endif
+	}
+	else {
+		timeout = 0;
+	}
+
 	while (!cb_data->is_finished) {
 
-		pfd.fd = rpc_get_fd(rpc);
-		pfd.events = rpc_which_events(rpc);
+		pfd.fd      = rpc_get_fd(rpc);
+		pfd.events  = rpc_which_events(rpc);
+		pfd.revents = 0;
 
-		ret =  poll(&pfd, 1, rpc_get_timeout(rpc));
+		ret = poll(&pfd, 1, 100);
 		if (ret < 0) {
 			rpc_set_error(rpc, "Poll failed");
-			cb_data->status = -EIO;
-			break;
-		} else if(ret == 0) {
-			rpc_set_error(rpc, "Timed out after [%d] milliseconds",rpc_get_timeout(rpc));
-			cb_data->status = -EIO;
-			break;
+			revents = -1;
+		} else {
+			revents = pfd.revents;
 		}
 
-		if (rpc_service(rpc, pfd.revents) < 0) {
-			rpc_set_error(rpc, "rpc_service failed");
+		if (rpc_service(rpc, revents) < 0) {
+			if (revents != -1)
+				rpc_set_error(rpc, "rpc_service failed");
 			cb_data->status = -EIO;
 			break;
 		}
 
 		if (rpc_get_fd(rpc) == -1) {
-			rpc_set_error(rpc, "Socket closed\n");
+			rpc_set_error(rpc, "Socket closed");
+			break;
+		}
+
+		if (timeout > 0 && rpc_current_time() > timeout) {
+			rpc_set_error(rpc, "Timeout reached");
 			break;
 		}
 	}
 }
 
-static void wait_for_nfs_reply(struct nfs_context *nfs, struct sync_cb_data *cb_data)
+static void
+wait_for_nfs_reply(struct nfs_context *nfs, struct sync_cb_data *cb_data)
 {
 	struct pollfd pfd;
-	int ret = -1;
+	int revents;
+	int ret;
 
+#ifdef HAVE_MULTITHREADING
+        if(nfs->rpc->multithreading_enabled) {
+                nfs_mt_sem_wait(&cb_data->wait_sem);
+                return;
+        }
+#endif
 	while (!cb_data->is_finished) {
 
 		pfd.fd = nfs_get_fd(nfs);
 		pfd.events = nfs_which_events(nfs);
+		pfd.revents = 0;
 
-		ret =  poll(&pfd, 1, nfs_get_timeout(nfs));
+		ret = poll(&pfd, 1, 100);
 		if (ret < 0) {
 			nfs_set_error(nfs, "Poll failed");
-			cb_data->status = -EIO;
-			break;
-		} else if(ret == 0) {
-			nfs_set_error(nfs, "Timed out after [%d] milliseconds",nfs_get_timeout(nfs));
-			cb_data->status = -EIO;
-			break;
+			revents = -1;
+		} else {
+			revents = pfd.revents;
 		}
 
-		if (nfs_service(nfs, pfd.revents) < 0) {
-			nfs_set_error(nfs, "nfs_service failed");
+		if (nfs_service(nfs, revents) < 0) {
+			if (revents != -1)
+				nfs_set_error(nfs, "nfs_service failed");
 			cb_data->status = -EIO;
+                        rpc_error_all_pdus(nfs->rpc, "RPC ERROR: Failed to reconnect async");
 			break;
 		}
 	}
@@ -177,37 +294,108 @@ static void wait_for_nfs_reply(struct nfs_context *nfs, struct sync_cb_data *cb_
 /*
  * connect to the server and mount the export
  */
-static void mount_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+mount_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "mount/mnt call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "%s: %s",
+                              __FUNCTION__, nfs_get_error(nfs));
+                goto finished;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_mount(struct nfs_context *nfs, const char *server, const char *export)
+int
+nfs_mount(struct nfs_context *nfs, const char *server, const char *export)
 {
 	struct sync_cb_data cb_data;
 	struct rpc_context *rpc = nfs_get_rpc_context(nfs);
 
 	assert(rpc->magic == RPC_CONTEXT_MAGIC);
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_mount_async(nfs, server, export, mount_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_mount_async failed");
+		nfs_set_error(nfs, "nfs_mount_async failed. %s",
+			      nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	/* Dont want any more callbacks even if the socket is closed */
 	rpc->connect_cb = NULL;
+
+	/* Ensure that no RPCs are pending. In error case (e.g. timeout in
+	 * wait_for_nfs_reply()) we can disconnect; in success case all RPCs
+	 * are completed by definition.
+	 */
+	if (cb_data.status) {
+		rpc_disconnect(rpc, "failed mount");
+	}
+
+	return cb_data.status;
+}
+
+
+/*
+ * unregister the mount
+ */
+static void
+umount_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+{
+	struct sync_cb_data *cb_data = private_data;
+
+	if (status < 0) {
+		nfs_set_error(nfs, "%s: %s",
+                              __FUNCTION__, nfs_get_error(nfs));
+                goto finished;
+	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
+}
+
+int
+nfs_umount(struct nfs_context *nfs)
+{
+	struct sync_cb_data cb_data;
+	struct rpc_context *rpc = nfs_get_rpc_context(nfs);
+
+	assert(rpc->magic == RPC_CONTEXT_MAGIC);
+
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
+
+	if (nfs_umount_async(nfs, umount_cb, &cb_data) != 0) {
+		nfs_set_error(nfs, "nfs_umount_async failed. %s",
+			      nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
+		return -1;
+	}
+
+	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
+
+	/* Dont want any more callbacks even if the socket is closed */
+	rpc->connect_cb = NULL;
+
+	/* Ensure that no RPCs are pending. In error case (e.g. timeout in
+	 * wait_for_nfs_reply()) we can disconnect; in success case all RPCs
+	 * are completed by definition.
+	 */
+	if (cb_data.status) {
+		rpc_disconnect(rpc, "failed mount");
+	}
 
 	return cb_data.status;
 }
@@ -216,89 +404,110 @@ int nfs_mount(struct nfs_context *nfs, const char *server, const char *export)
 /*
  * stat()
  */
-static void stat_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+stat_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "stat call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "stat call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
 #ifdef WIN32
 	memcpy(cb_data->return_data, data, sizeof(struct __stat64));
 #else
-  memcpy(cb_data->return_data, data, sizeof(struct stat));
+        memcpy(cb_data->return_data, data, sizeof(struct stat));
 #endif
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
+int
 #ifdef WIN32
-int nfs_stat(struct nfs_context *nfs, const char *path, struct __stat64 *st)
+nfs_stat(struct nfs_context *nfs, const char *path, struct __stat64 *st)
 #else
-int nfs_stat(struct nfs_context *nfs, const char *path, struct stat *st)
+nfs_stat(struct nfs_context *nfs, const char *path, struct stat *st)
 #endif
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
 	cb_data.return_data = st;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_stat_async(nfs, path, stat_cb, &cb_data) != 0) {
 		nfs_set_error(nfs, "nfs_stat_async failed");
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
 
-static void stat64_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+stat64_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "stat call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "stat call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
 	memcpy(cb_data->return_data, data, sizeof(struct nfs_stat_64));
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_stat64(struct nfs_context *nfs, const char *path, struct nfs_stat_64 *st)
+int
+nfs_stat64(struct nfs_context *nfs, const char *path, struct nfs_stat_64 *st)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
 	cb_data.return_data = st;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_stat64_async(nfs, path, stat64_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_stat64_async failed");
+		nfs_set_error(nfs, "nfs_stat64_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
 
-int nfs_lstat64(struct nfs_context *nfs, const char *path, struct nfs_stat_64 *st)
+int
+nfs_lstat64(struct nfs_context *nfs, const char *path, struct nfs_stat_64 *st)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
 	cb_data.return_data = st;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_lstat64_async(nfs, path, stat64_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_lstat64_async failed");
+		nfs_set_error(nfs, "nfs_lstat64_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -306,37 +515,78 @@ int nfs_lstat64(struct nfs_context *nfs, const char *path, struct nfs_stat_64 *s
 /*
  * open()
  */
-static void open_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+open_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 	struct nfsfh *fh, **nfsfh;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "open call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "open call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
 
 	fh    = data;
 	nfsfh = cb_data->return_data;
 	*nfsfh = fh;
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_open(struct nfs_context *nfs, const char *path, int flags, struct nfsfh **nfsfh)
+int
+nfs_open(struct nfs_context *nfs, const char *path, int flags,
+         struct nfsfh **nfsfh)
 {
 	struct sync_cb_data cb_data;
-
-	cb_data.is_finished = 0;
+        int retry = 0;
+        struct nfs_context *onfs = nfs;
+        
+ try_again:
+        nfs = onfs;
 	cb_data.return_data = nfsfh;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
-	if (nfs_open_async(nfs, path, flags, open_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_open_async failed");
+ 	if (nfs_open_async(nfs, path, flags, open_cb, &cb_data) != 0) {
+		nfs_set_error(nfs, "nfs_open_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
+
+        if (cb_data.status == -EIO && retry < 10) {
+                retry++;
+                goto try_again;
+        }
+	return cb_data.status;
+}
+
+int
+nfs_open2(struct nfs_context *nfs, const char *path, int flags,
+          int mode, struct nfsfh **nfsfh)
+{
+	struct sync_cb_data cb_data;
+
+	cb_data.return_data = nfsfh;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
+
+	if (nfs_open2_async(nfs, path, flags, mode, open_cb, &cb_data) != 0) {
+		nfs_set_error(nfs, "nfs_open2_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
+		return -1;
+	}
+
+	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -344,71 +594,88 @@ int nfs_open(struct nfs_context *nfs, const char *path, int flags, struct nfsfh 
 /*
  * chdir()
  */
-static void chdir_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+chdir_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "chdir call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "chdir call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_chdir(struct nfs_context *nfs, const char *path)
+int
+nfs_chdir(struct nfs_context *nfs, const char *path)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_chdir_async(nfs, path, chdir_cb, &cb_data) != 0) {
 		nfs_set_error(nfs, "nfs_chdir_async failed with %s",
 			nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
 
 
-
 /*
  * pread()
  */
-static void pread_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+pread_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 	char *buffer;
-	cb_data->is_finished = 1;
-	cb_data->status = status;
 
 	if (status < 0) {
-		nfs_set_error(nfs, "%s call failed with \"%s\"", cb_data->call, (char *)data);
-		return;
+		nfs_set_error(nfs, "%s call failed with \"%s\"", cb_data->call,
+                              (char *)data);
+                goto finished;
 	}
 
 	buffer = cb_data->return_data;
 	memcpy(buffer, (char *)data, status);
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_pread(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t offset, uint64_t count, void *buffer)
+int
+nfs_pread(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t offset,
+          uint64_t count, void *buffer)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
 	cb_data.return_data = buffer;
 	cb_data.call = "pread";
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
-	if (nfs_pread_async(nfs, nfsfh, offset, count, pread_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_pread_async failed");
+	if (nfs_pread_async(nfs, nfsfh, offset, count, pread_cb,
+                            &cb_data) != 0) {
+		nfs_set_error(nfs, "nfs_pread_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -416,20 +683,27 @@ int nfs_pread(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t offset, uin
 /*
  * read()
  */
-int nfs_read(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t count, void *buffer)
+int
+nfs_read(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t count,
+         void *buffer)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
 	cb_data.return_data = buffer;
 	cb_data.call = "read";
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_read_async(nfs, nfsfh, count, pread_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_read_async failed");
+		nfs_set_error(nfs, "nfs_read_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -437,57 +711,69 @@ int nfs_read(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t count, void 
 /*
  * close()
  */
-static void close_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+close_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
-	cb_data->is_finished = 1;
-	cb_data->status = status;
 
 	if (status < 0) {
-		nfs_set_error(nfs, "close call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "close call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_close(struct nfs_context *nfs, struct nfsfh *nfsfh)
+int
+nfs_close(struct nfs_context *nfs, struct nfsfh *nfsfh)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_close_async(nfs, nfsfh, close_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_close_async failed");
+		nfs_set_error(nfs, "nfs_close_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
 
 
-
-
 /*
  * fstat()
  */
+int
 #ifdef WIN32
-int nfs_fstat(struct nfs_context *nfs, struct nfsfh *nfsfh, struct __stat64 *st)
+nfs_fstat(struct nfs_context *nfs, struct nfsfh *nfsfh, struct __stat64 *st)
 #else
-int nfs_fstat(struct nfs_context *nfs, struct nfsfh *nfsfh, struct stat *st)
+nfs_fstat(struct nfs_context *nfs, struct nfsfh *nfsfh, struct stat *st)
 #endif
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
 	cb_data.return_data = st;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_fstat_async(nfs, nfsfh, stat_cb, &cb_data) != 0) {
 		nfs_set_error(nfs, "nfs_fstat_async failed");
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -495,19 +781,26 @@ int nfs_fstat(struct nfs_context *nfs, struct nfsfh *nfsfh, struct stat *st)
 /*
  * fstat64()
  */
-int nfs_fstat64(struct nfs_context *nfs, struct nfsfh *nfsfh, struct nfs_stat_64 *st)
+int
+nfs_fstat64(struct nfs_context *nfs, struct nfsfh *nfsfh,
+            struct nfs_stat_64 *st)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
 	cb_data.return_data = st;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_fstat64_async(nfs, nfsfh, stat64_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_fstat64_async failed");
+		nfs_set_error(nfs, "nfs_fstat64_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -516,29 +809,42 @@ int nfs_fstat64(struct nfs_context *nfs, struct nfsfh *nfsfh, struct nfs_stat_64
 /*
  * pwrite()
  */
-static void pwrite_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+pwrite_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
-	cb_data->is_finished = 1;
-	cb_data->status = status;
 
-	if (status < 0)
-		nfs_set_error(nfs, "%s call failed with \"%s\"", cb_data->call, (char *)data);
+	if (status < 0) {
+		nfs_set_error(nfs, "%s call failed with \"%s\"",
+                              cb_data->call, (char *)data);
+                goto finished;
+	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_pwrite(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t offset, uint64_t count, const void *buf)
+int
+nfs_pwrite(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t offset,
+           uint64_t count, const void *buf)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
 	cb_data.call = "pwrite";
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
-	if (nfs_pwrite_async(nfs, nfsfh, offset, count, buf, pwrite_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_pwrite_async failed");
+	if (nfs_pwrite_async(nfs, nfsfh, offset, count, buf, pwrite_cb,
+                             &cb_data) != 0) {
+		nfs_set_error(nfs, "nfs_pwrite_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -546,19 +852,26 @@ int nfs_pwrite(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t offset, ui
 /*
  * write()
  */
-int nfs_write(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t count, const void *buf)
+int
+nfs_write(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t count,
+          const void *buf)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
 	cb_data.call = "write";
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_write_async(nfs, nfsfh, count, buf, pwrite_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_write_async failed");
+		nfs_set_error(nfs, "nfs_write_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -567,64 +880,82 @@ int nfs_write(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t count, cons
 /*
  * fsync()
  */
-static void fsync_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+fsync_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
-	cb_data->is_finished = 1;
-	cb_data->status = status;
 
 	if (status < 0) {
-		nfs_set_error(nfs, "fsync call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "fsync call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_fsync(struct nfs_context *nfs, struct nfsfh *nfsfh)
+int
+nfs_fsync(struct nfs_context *nfs, struct nfsfh *nfsfh)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_fsync_async(nfs, nfsfh, fsync_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_fsync_async failed");
+		nfs_set_error(nfs, "nfs_fsync_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
 
 
-
-
 /*
  * ftruncate()
  */
-static void ftruncate_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+ftruncate_cb(int status, struct nfs_context *nfs, void *data,
+             void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
-	cb_data->is_finished = 1;
-	cb_data->status = status;
 
 	if (status < 0) {
-		nfs_set_error(nfs, "ftruncate call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "ftruncate call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_ftruncate(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t length)
+int
+nfs_ftruncate(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t length)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
-	if (nfs_ftruncate_async(nfs, nfsfh, length, ftruncate_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_ftruncate_async failed");
+	if (nfs_ftruncate_async(nfs, nfsfh, length, ftruncate_cb,
+                                &cb_data) != 0) {
+		nfs_set_error(nfs, "nfs_ftruncate_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -634,69 +965,103 @@ int nfs_ftruncate(struct nfs_context *nfs, struct nfsfh *nfsfh, uint64_t length)
 /*
  * truncate()
  */
-static void truncate_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+truncate_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
-	cb_data->is_finished = 1;
-	cb_data->status = status;
 
 	if (status < 0) {
-		nfs_set_error(nfs, "truncate call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "truncate call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
 int nfs_truncate(struct nfs_context *nfs, const char *path, uint64_t length)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_truncate_async(nfs, path, length, truncate_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_ftruncate_async failed");
+		nfs_set_error(nfs, "nfs_ftruncate_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
-
-
-
 
 
 /*
  * mkdir()
  */
-static void mkdir_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+mkdir_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
-	cb_data->is_finished = 1;
-	cb_data->status = status;
 
 	if (status < 0) {
-		nfs_set_error(nfs, "mkdir call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "mkdir call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_mkdir(struct nfs_context *nfs, const char *path)
+int
+nfs_mkdir(struct nfs_context *nfs, const char *path)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_mkdir_async(nfs, path, mkdir_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_mkdir_async failed");
+		nfs_set_error(nfs, "nfs_mkdir_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
 
+int
+nfs_mkdir2(struct nfs_context *nfs, const char *path, int mode)
+{
+	struct sync_cb_data cb_data;
+
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
+
+	if (nfs_mkdir2_async(nfs, path, mode, mkdir_cb, &cb_data) != 0) {
+		nfs_set_error(nfs, "nfs_mkdir2_async failed");
+                nfs_destroy_cb_sem(&cb_data);
+		return -1;
+	}
+
+	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
+
+	return cb_data.status;
+}
 
 
 
@@ -704,31 +1069,39 @@ int nfs_mkdir(struct nfs_context *nfs, const char *path)
 /*
  * rmdir()
  */
-static void rmdir_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+rmdir_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
-	cb_data->is_finished = 1;
-	cb_data->status = status;
 
 	if (status < 0) {
-		nfs_set_error(nfs, "rmdir call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "rmdir call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
 int nfs_rmdir(struct nfs_context *nfs, const char *path)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_rmdir_async(nfs, path, rmdir_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_rmdir_async failed");
+		nfs_set_error(nfs, "nfs_rmdir_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
-
+        nfs_destroy_cb_sem(&cb_data);
+        
 	return cb_data.status;
 }
 
@@ -737,42 +1110,53 @@ int nfs_rmdir(struct nfs_context *nfs, const char *path)
 /*
  * creat()
  */
-static void creat_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+creat_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 	struct nfsfh *fh, **nfsfh;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "creat call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "creat call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
 
 	fh    = data;
 	nfsfh = cb_data->return_data;
 	*nfsfh = fh;
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_create(struct nfs_context *nfs, const char *path, int flags, int mode, struct nfsfh **nfsfh)
+int
+nfs_create(struct nfs_context *nfs, const char *path, int flags, int mode,
+           struct nfsfh **nfsfh)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
 	cb_data.return_data = nfsfh;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_create_async(nfs, path, flags, mode, creat_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_create_async failed");
+		nfs_set_error(nfs, "nfs_create_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
 
-int nfs_creat(struct nfs_context *nfs, const char *path, int mode, struct nfsfh **nfsfh)
+int
+nfs_creat(struct nfs_context *nfs, const char *path, int mode,
+          struct nfsfh **nfsfh)
 {
 	return nfs_create(nfs, path, 0, mode, nfsfh);
 }
@@ -780,31 +1164,39 @@ int nfs_creat(struct nfs_context *nfs, const char *path, int mode, struct nfsfh 
 /*
  * mknod()
  */
-static void mknod_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+mknod_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "mknod call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "mknod call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_mknod(struct nfs_context *nfs, const char *path, int mode, int dev)
+int
+nfs_mknod(struct nfs_context *nfs, const char *path, int mode, int dev)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_mknod_async(nfs, path, mode, dev, mknod_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_creat_async failed");
+		nfs_set_error(nfs, "nfs_creat_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -813,31 +1205,39 @@ int nfs_mknod(struct nfs_context *nfs, const char *path, int mode, int dev)
 /*
  * unlink()
  */
-static void unlink_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+unlink_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "unlink call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "unlink call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_unlink(struct nfs_context *nfs, const char *path)
+int
+nfs_unlink(struct nfs_context *nfs, const char *path)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_unlink_async(nfs, path, unlink_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_unlink_async failed");
+		nfs_set_error(nfs, "nfs_unlink_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -847,37 +1247,45 @@ int nfs_unlink(struct nfs_context *nfs, const char *path)
 /*
  * opendir()
  */
-static void opendir_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+opendir_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 	struct nfsdir *dir, **nfsdir;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "opendir call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "opendir call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
 
 	dir     = data;
 	nfsdir  = cb_data->return_data;
 	*nfsdir = dir;
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_opendir(struct nfs_context *nfs, const char *path, struct nfsdir **nfsdir)
+int
+nfs_opendir(struct nfs_context *nfs, const char *path, struct nfsdir **nfsdir)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
 	cb_data.return_data = nfsdir;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_opendir_async(nfs, path, opendir_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_opendir_async failed");
+		nfs_set_error(nfs, "nfs_opendir_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -886,119 +1294,318 @@ int nfs_opendir(struct nfs_context *nfs, const char *path, struct nfsdir **nfsdi
 /*
  * lseek()
  */
-static void lseek_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+lseek_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "lseek call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "lseek call failed with \"%s\"",
+                              nfs_get_error(nfs));
+                goto finished;
 	}
 
 	if (cb_data->return_data != NULL) {
 		memcpy(cb_data->return_data, data, sizeof(uint64_t));
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_lseek(struct nfs_context *nfs, struct nfsfh *nfsfh, int64_t offset, int whence, uint64_t *current_offset)
+int
+nfs_lseek(struct nfs_context *nfs, struct nfsfh *nfsfh, int64_t offset, int whence, uint64_t *current_offset)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
 	cb_data.return_data = current_offset;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
-	if (nfs_lseek_async(nfs, nfsfh, offset, whence, lseek_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_lseek_async failed");
+	if (nfs_lseek_async(nfs, nfsfh, offset, whence, lseek_cb,
+                            &cb_data) != 0) {
+		nfs_set_error(nfs, "nfs_lseek_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
 
 
+/*
+ * lockf()
+ */
+static void
+lockf_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+{
+	struct sync_cb_data *cb_data = private_data;
+
+	if (status < 0) {
+		nfs_set_error(nfs, "lockf call failed with \"%s\"",
+                              nfs_get_error(nfs));
+                goto finished;
+	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
+}
+
+int
+nfs_lockf(struct nfs_context *nfs, struct nfsfh *nfsfh,
+          enum nfs4_lock_op cmd, uint64_t count)
+{
+	struct sync_cb_data cb_data;
+
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
+
+	if (nfs_lockf_async(nfs, nfsfh, cmd, count,
+                            lockf_cb, &cb_data) != 0) {
+		nfs_set_error(nfs, "nfs_lockf_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
+		return -1;
+	}
+
+	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
+
+	return cb_data.status;
+}
+
+/*
+ * fcntl()
+ */
+static void
+fcntl_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+{
+	struct sync_cb_data *cb_data = private_data;
+
+	if (status < 0) {
+		nfs_set_error(nfs, "fcntl call failed with \"%s\"",
+                              nfs_get_error(nfs));
+                goto finished;
+	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
+}
+
+int
+nfs_fcntl(struct nfs_context *nfs, struct nfsfh *nfsfh,
+          enum nfs4_fcntl_op cmd, void *arg)
+{
+	struct sync_cb_data cb_data;
+
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
+
+	if (nfs_fcntl_async(nfs, nfsfh, cmd, arg,
+                            fcntl_cb, &cb_data) != 0) {
+		nfs_set_error(nfs, "nfs_fcntl_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
+		return -1;
+	}
+
+	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
+
+	return cb_data.status;
+}
 
 /*
  * statvfs()
  */
-static void statvfs_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+statvfs_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "statvfs call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "statvfs call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
 
 	memcpy(cb_data->return_data, data, sizeof(struct statvfs));
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_statvfs(struct nfs_context *nfs, const char *path, struct statvfs *svfs)
+int
+nfs_statvfs(struct nfs_context *nfs, const char *path, struct statvfs *svfs)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
 	cb_data.return_data = svfs;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_statvfs_async(nfs, path, statvfs_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_statvfs_async failed");
+		nfs_set_error(nfs, "nfs_statvfs_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
 
+/*
+ * statvfs64()
+ */
+static void
+statvfs64_cb(int status, struct nfs_context *nfs, void *data,
+             void *private_data)
+{
+	struct sync_cb_data *cb_data = private_data;
 
+	if (status < 0) {
+		nfs_set_error(nfs, "statvfs64 call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
+	}
 
+	memcpy(cb_data->return_data, data, sizeof(struct nfs_statvfs_64));
 
+ finished:
+        cb_data_is_finished(cb_data, status);
+}
+
+int
+nfs_statvfs64(struct nfs_context *nfs, const char *path,
+              struct nfs_statvfs_64 *svfs)
+{
+	struct sync_cb_data cb_data;
+
+	cb_data.return_data = svfs;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
+
+	if (nfs_statvfs64_async(nfs, path, statvfs64_cb, &cb_data) != 0) {
+		nfs_set_error(nfs, "nfs_statvfs64_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
+		return -1;
+	}
+
+	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
+
+	return cb_data.status;
+}
 
 /*
  * readlink()
  */
-static void readlink_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+readlink_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "readlink call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "readlink call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
 
 	if (strlen(data) > (size_t)cb_data->return_int) {
 		nfs_set_error(nfs, "Too small buffer for readlink");
 		cb_data->status = -ENAMETOOLONG;
-		return;
+                goto finished;
 	}
 
 	memcpy(cb_data->return_data, data, strlen(data)+1);
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_readlink(struct nfs_context *nfs, const char *path, char *buf, int bufsize)
+int
+nfs_readlink(struct nfs_context *nfs, const char *path, char *buf, int bufsize)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
 	cb_data.return_data = buf;
 	cb_data.return_int  = bufsize;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_readlink_async(nfs, path, readlink_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_readlink_async failed");
+		nfs_set_error(nfs, "nfs_readlink_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
+
+	return cb_data.status;
+}
+
+static void
+readlink2_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+{
+	struct sync_cb_data *cb_data = private_data;
+	char **bufptr;
+	char *buf;
+
+	if (status < 0) {
+		nfs_set_error(nfs, "readlink call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
+	}
+
+	buf = strdup(data);
+	if (buf == NULL) {
+		cb_data->status = errno ? -errno : -ENOMEM;
+                goto finished;
+	}
+
+	bufptr = cb_data->return_data;
+	if (bufptr)
+		*bufptr = buf;
+
+ finished:
+        cb_data_is_finished(cb_data, status);
+}
+
+int
+nfs_readlink2(struct nfs_context *nfs, const char *path, char **bufptr)
+{
+	struct sync_cb_data cb_data;
+
+	*bufptr = NULL;
+	cb_data.return_data = bufptr;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
+
+	if (nfs_readlink_async(nfs, path, readlink2_cb, &cb_data) != 0) {
+		nfs_set_error(nfs, "nfs_readlink_async failed");
+                nfs_destroy_cb_sem(&cb_data);
+		return -1;
+	}
+
+	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -1008,47 +1615,61 @@ int nfs_readlink(struct nfs_context *nfs, const char *path, char *buf, int bufsi
 /*
  * chmod()
  */
-static void chmod_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+chmod_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "chmod call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "chmod call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_chmod(struct nfs_context *nfs, const char *path, int mode)
+int
+nfs_chmod(struct nfs_context *nfs, const char *path, int mode)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_chmod_async(nfs, path, mode, chmod_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_chmod_async failed");
+		nfs_set_error(nfs, "nfs_chmod_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
 
-int nfs_lchmod(struct nfs_context *nfs, const char *path, int mode)
+int
+nfs_lchmod(struct nfs_context *nfs, const char *path, int mode)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_lchmod_async(nfs, path, mode, chmod_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_lchmod_async failed");
+		nfs_set_error(nfs, "nfs_lchmod_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -1059,31 +1680,39 @@ int nfs_lchmod(struct nfs_context *nfs, const char *path, int mode)
 /*
  * fchmod()
  */
-static void fchmod_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+fchmod_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "fchmod call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "fchmod call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_fchmod(struct nfs_context *nfs, struct nfsfh *nfsfh, int mode)
+int
+nfs_fchmod(struct nfs_context *nfs, struct nfsfh *nfsfh, int mode)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_fchmod_async(nfs, nfsfh, mode, fchmod_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_fchmod_async failed");
+		nfs_set_error(nfs, "nfs_fchmod_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -1094,31 +1723,39 @@ int nfs_fchmod(struct nfs_context *nfs, struct nfsfh *nfsfh, int mode)
 /*
  * chown()
  */
-static void chown_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+chown_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "chown call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "chown call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_chown(struct nfs_context *nfs, const char *path, int uid, int gid)
+int
+nfs_chown(struct nfs_context *nfs, const char *path, int uid, int gid)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_chown_async(nfs, path, uid, gid, chown_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_chown_async failed");
+		nfs_set_error(nfs, "nfs_chown_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -1126,18 +1763,24 @@ int nfs_chown(struct nfs_context *nfs, const char *path, int uid, int gid)
 /*
  * lchown()
  */
-int nfs_lchown(struct nfs_context *nfs, const char *path, int uid, int gid)
+int
+nfs_lchown(struct nfs_context *nfs, const char *path, int uid, int gid)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_lchown_async(nfs, path, uid, gid, chown_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_lchown_async failed");
+		nfs_set_error(nfs, "nfs_lchown_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -1145,31 +1788,39 @@ int nfs_lchown(struct nfs_context *nfs, const char *path, int uid, int gid)
 /*
  * fchown()
  */
-static void fchown_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+fchown_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "fchown call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "fchown call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_fchown(struct nfs_context *nfs, struct nfsfh *nfsfh, int uid, int gid)
+int
+nfs_fchown(struct nfs_context *nfs, struct nfsfh *nfsfh, int uid, int gid)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_fchown_async(nfs, nfsfh, uid, gid, fchown_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_fchown_async failed");
+		nfs_set_error(nfs, "nfs_fchown_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -1179,47 +1830,61 @@ int nfs_fchown(struct nfs_context *nfs, struct nfsfh *nfsfh, int uid, int gid)
 /*
  * utimes()
  */
-static void utimes_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+utimes_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "utimes call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "utimes call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_utimes(struct nfs_context *nfs, const char *path, struct timeval *times)
+int
+nfs_utimes(struct nfs_context *nfs, const char *path, struct timeval *times)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_utimes_async(nfs, path, times, utimes_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_utimes_async failed");
+		nfs_set_error(nfs, "nfs_utimes_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
 
-int nfs_lutimes(struct nfs_context *nfs, const char *path, struct timeval *times)
+int
+nfs_lutimes(struct nfs_context *nfs, const char *path, struct timeval *times)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_lutimes_async(nfs, path, times, utimes_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_lutimes_async failed");
+		nfs_set_error(nfs, "nfs_lutimes_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -1229,66 +1894,79 @@ int nfs_lutimes(struct nfs_context *nfs, const char *path, struct timeval *times
 /*
  * utime()
  */
-static void utime_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+utime_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "utime call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "utime call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_utime(struct nfs_context *nfs, const char *path, struct utimbuf *times)
+int
+nfs_utime(struct nfs_context *nfs, const char *path, struct utimbuf *times)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_utime_async(nfs, path, times, utime_cb, &cb_data) != 0) {
 		nfs_set_error(nfs, "nfs_utimes_async failed");
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
 
 
-
-
 /*
  * access()
  */
-static void access_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+access_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "access call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "access call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_access(struct nfs_context *nfs, const char *path, int mode)
+int
+nfs_access(struct nfs_context *nfs, const char *path, int mode)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_access_async(nfs, path, mode, access_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_access_async failed");
+		nfs_set_error(nfs, "nfs_access_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -1298,31 +1976,39 @@ int nfs_access(struct nfs_context *nfs, const char *path, int mode)
 /*
  * access2()
  */
-static void access2_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+access2_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "access2 call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "access2 call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_access2(struct nfs_context *nfs, const char *path)
+int
+nfs_access2(struct nfs_context *nfs, const char *path)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_access2_async(nfs, path, access2_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_access2_async failed");
+		nfs_set_error(nfs, "nfs_access2_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -1332,65 +2018,81 @@ int nfs_access2(struct nfs_context *nfs, const char *path)
 /*
  * symlink()
  */
-static void symlink_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+symlink_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "symlink call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "symlink call failed with \"%s\"",
+			      (char *)data);
+                goto finished;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_symlink(struct nfs_context *nfs, const char *oldpath, const char *newpath)
+int
+nfs_symlink(struct nfs_context *nfs, const char *target, const char *linkname)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
-	if (nfs_symlink_async(nfs, oldpath, newpath, symlink_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_symlink_async failed");
+	if (nfs_symlink_async(nfs, target, linkname, symlink_cb,
+			      &cb_data) != 0) {
+                nfs_set_error(nfs, "nfs_symlink_async failed: %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
 
 
-
 /*
  * rename()
  */
-static void rename_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+rename_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "rename call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "rename call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_rename(struct nfs_context *nfs, const char *oldpath, const char *newpath)
+int
+nfs_rename(struct nfs_context *nfs, const char *oldpath, const char *newpath)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_rename_async(nfs, oldpath, newpath, rename_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_rename_async failed");
+		nfs_set_error(nfs, "nfs_rename_async failed: %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
@@ -1400,49 +2102,198 @@ int nfs_rename(struct nfs_context *nfs, const char *oldpath, const char *newpath
 /*
  * link()
  */
-static void link_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+static void
+link_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
-
 	if (status < 0) {
-		nfs_set_error(nfs, "link call failed with \"%s\"", (char *)data);
-		return;
+		nfs_set_error(nfs, "link call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-int nfs_link(struct nfs_context *nfs, const char *oldpath, const char *newpath)
+int
+nfs_link(struct nfs_context *nfs, const char *oldpath, const char *newpath)
 {
 	struct sync_cb_data cb_data;
 
-	cb_data.is_finished = 0;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
 
 	if (nfs_link_async(nfs, oldpath, newpath, link_cb, &cb_data) != 0) {
-		nfs_set_error(nfs, "nfs_link_async failed");
+		nfs_set_error(nfs, "nfs_link_async failed: %s",
+			      nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
 		return -1;
 	}
 
 	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 
 	return cb_data.status;
 }
 
-void mount_getexports_cb(struct rpc_context *mount_context, int status, void *data, void *private_data)
+
+/*
+ * nfs3_getacl()
+ */
+void nfs3_acl_free(fattr3_acl *nfs3acl)
+{
+	if (nfs3acl == NULL) {
+		return;
+	}
+	if (nfs3acl->ace) {
+		free(nfs3acl->ace);
+	}
+	if (nfs3acl->default_ace) {
+		free(nfs3acl->default_ace);
+	}
+}
+
+static void
+nfs3_getacl_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+{
+	struct sync_cb_data *cb_data = private_data;
+        fattr3_acl *src = data;
+        fattr3_acl *dst = cb_data->return_data;
+
+	if (status < 0) {
+		nfs_set_error(nfs, "getacl call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
+	}
+        memcpy(dst, src, sizeof(fattr3_acl));
+        src->ace = NULL; /* steal the pointer to ACEs */
+        src->default_ace = NULL; /* steal the pointer to Default ACEs */
+
+ finished:
+        cb_data_is_finished(cb_data, status);
+}
+
+int
+nfs3_getacl(struct nfs_context *nfs, struct nfsfh *nfsfh,
+            fattr3_acl *acl)
+{
+	struct sync_cb_data cb_data;
+
+	cb_data.return_data = acl;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
+
+	if (nfs3_getacl_async(nfs, nfsfh, nfs3_getacl_cb, &cb_data) != 0) {
+		nfs_set_error(nfs, "nfs_getacl_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
+		return -1;
+	}
+
+	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
+
+	return cb_data.status;
+}
+
+
+/*
+ * nfs4_getacl()
+ */
+void nfs4_acl_free(fattr4_acl *acl)
+{
+        int i;
+
+        for (i = 0; i < acl->fattr4_acl_len; i++) {
+                free(acl->fattr4_acl_val[i].who.utf8string_val);
+        }
+        free(acl->fattr4_acl_val);
+}
+
+static void
+nfs4_getacl_cb(int status, struct nfs_context *nfs, void *data, void *private_data)
+{
+	struct sync_cb_data *cb_data = private_data;
+        fattr4_acl *src = data;
+        fattr4_acl *dst = cb_data->return_data;
+        int i;
+
+	if (status < 0) {
+		nfs_set_error(nfs, "getacl call failed with \"%s\"",
+                              (char *)data);
+                goto finished;
+	}
+        dst->fattr4_acl_len = src->fattr4_acl_len;
+        dst->fattr4_acl_val = calloc(dst->fattr4_acl_len, sizeof(nfsace4));
+        if (dst->fattr4_acl_val == NULL) {
+                cb_data->status = -ENOMEM;
+		nfs_set_error(nfs, "Failed to allocate fattr4_acl_val");
+                goto finished;
+        }                
+        for (i = 0; i < dst->fattr4_acl_len; i++) {
+                dst->fattr4_acl_val[i].type = src->fattr4_acl_val[i].type;
+                dst->fattr4_acl_val[i].flag = src->fattr4_acl_val[i].flag;
+                dst->fattr4_acl_val[i].access_mask = src->fattr4_acl_val[i].access_mask;
+                dst->fattr4_acl_val[i].who.utf8string_len = src->fattr4_acl_val[i].who.utf8string_len;
+                dst->fattr4_acl_val[i].who.utf8string_val = calloc(dst->fattr4_acl_val[i].who.utf8string_len + 1, 1);
+                if (dst->fattr4_acl_val[i].who.utf8string_val == NULL) {
+                        cb_data->status = -ENOMEM;
+                        nfs4_acl_free(dst);
+                        nfs_set_error(nfs, "Failed to allocate acl name");
+                        goto finished;
+                }
+                memcpy(dst->fattr4_acl_val[i].who.utf8string_val,
+                       src->fattr4_acl_val[i].who.utf8string_val,
+                       dst->fattr4_acl_val[i].who.utf8string_len);
+        }
+
+ finished:
+        cb_data_is_finished(cb_data, status);
+}
+
+int
+nfs4_getacl(struct nfs_context *nfs, struct nfsfh *nfsfh,
+            fattr4_acl *acl)
+{
+	struct sync_cb_data cb_data;
+
+	cb_data.return_data = acl;
+        if (nfs_init_cb_data(&nfs, &cb_data)) {
+                return -1;
+        }
+
+	if (nfs4_getacl_async(nfs, nfsfh, nfs4_getacl_cb, &cb_data) != 0) {
+		nfs_set_error(nfs, "nfs_getacl_async failed. %s",
+                              nfs_get_error(nfs));
+                nfs_destroy_cb_sem(&cb_data);
+		return -1;
+	}
+
+	wait_for_nfs_reply(nfs, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
+
+	return cb_data.status;
+}
+
+void
+mount_getexports_cb(struct rpc_context *mount_context, int status, void *data,
+                    void *private_data)
 {
 	struct sync_cb_data *cb_data = private_data;
 	exports export;
 
 	assert(mount_context->magic == RPC_CONTEXT_MAGIC);
 
-	cb_data->is_finished = 1;
-	cb_data->status = status;
 	cb_data->return_data = NULL;
 
 	if (status != 0) {
-		rpc_set_error(mount_context, "mount/export call failed with \"%s\"", (char *)data);
-		return;
+		rpc_set_error(mount_context, "mount/export call failed with "
+                              "\"%s\"", (char *)data);
+                goto finished;
 	}
 
 	export = *(exports *)data;
@@ -1458,30 +2309,47 @@ void mount_getexports_cb(struct rpc_context *mount_context, int status, void *da
 
 		export = export->ex_next;
 	}
+
+ finished:
+        cb_data_is_finished(cb_data, status);
 }
 
-struct exportnode *mount_getexports(const char *server)
+struct exportnode *
+mount_getexports_timeout(const char *server, int timeout)
 {
 	struct sync_cb_data cb_data;
 	struct rpc_context *rpc;
 
 
-	cb_data.is_finished = 0;
 	cb_data.return_data = NULL;
+        if (nfs_init_cb_data(NULL, &cb_data)) {
+                return NULL;
+        }
 
 	rpc = rpc_init_context();
-	if (mount_getexports_async(rpc, server, mount_getexports_cb, &cb_data) != 0) {
+	rpc_set_timeout(rpc, timeout);
+	if (mount_getexports_async(rpc, server, mount_getexports_cb,
+                                   &cb_data) != 0) {
 		rpc_destroy_context(rpc);
+                nfs_destroy_cb_sem(&cb_data);
 		return NULL;
 	}
 
 	wait_for_reply(rpc, &cb_data);
+        nfs_destroy_cb_sem(&cb_data);
 	rpc_destroy_context(rpc);
 
 	return cb_data.return_data;
 }
 
-void mount_free_export_list(struct exportnode *exp)
+struct exportnode *
+mount_getexports(const char *server)
+{
+	return mount_getexports_timeout(server, -1);
+}
+
+void
+mount_free_export_list(struct exportnode *exp)
 {
 	struct exportnode *tmp;
 
@@ -1492,9 +2360,10 @@ void mount_free_export_list(struct exportnode *exp)
 	}
 }
 
+#if !defined(NO_SRV_AUTOSCAN)
 
-
-void free_nfs_srvr_list(struct nfs_server_list *srv)
+void
+free_nfs_srvr_list(struct nfs_server_list *srv)
 {
 	while (srv != NULL) {
 		struct nfs_server_list *next = srv->next;
@@ -1510,7 +2379,9 @@ struct nfs_list_data {
        struct nfs_server_list *srvrs;
 };
 
-void callit_cb(struct rpc_context *rpc, int status, void *data _U_, void *private_data)
+void
+callit_cb(struct rpc_context *rpc, int status, void *data _U_,
+          void *private_data)
 {
 	struct nfs_list_data *srv_data = private_data;
 	struct sockaddr *sin;
@@ -1534,7 +2405,8 @@ void callit_cb(struct rpc_context *rpc, int status, void *data _U_, void *privat
 		return;
 	}
 
-	if (getnameinfo(sin, sizeof(struct sockaddr_in), &hostdd[0], sizeof(hostdd), NULL, 0, NI_NUMERICHOST) < 0) {
+	if (getnameinfo(sin, sizeof(struct sockaddr_in), &hostdd[0],
+                        sizeof(hostdd), NULL, 0, NI_NUMERICHOST) < 0) {
 		rpc_set_error(rpc, "getnameinfo failed in CALLIT callback");
 		srv_data->status = -1;
 		return;
@@ -1549,14 +2421,16 @@ void callit_cb(struct rpc_context *rpc, int status, void *data _U_, void *privat
 
 	srvr = malloc(sizeof(struct nfs_server_list));
 	if (srvr == NULL) {
-		rpc_set_error(rpc, "Malloc failed when allocating server structure");
+		rpc_set_error(rpc, "Malloc failed when allocating server "
+                              "structure");
 		srv_data->status = -1;
 		return;
 	}
 
 	srvr->addr = strdup(hostdd);
 	if (srvr->addr == NULL) {
-		rpc_set_error(rpc, "Strdup failed when allocating server structure");
+		rpc_set_error(rpc, "Strdup failed when allocating server "
+                              "structure");
 		free(srvr);
 		srv_data->status = -1;
 		return;
@@ -1568,7 +2442,9 @@ void callit_cb(struct rpc_context *rpc, int status, void *data _U_, void *privat
 
 #ifdef WIN32
 
-static int send_nfsd_probes(struct rpc_context *rpc, INTERFACE_INFO *InterfaceList, int numIfs, struct nfs_list_data *data)
+static int
+send_nfsd_probes(struct rpc_context *rpc, INTERFACE_INFO *InterfaceList,
+                 int numIfs, struct nfs_list_data *data)
 {
   int i=0;
 
@@ -1620,7 +2496,8 @@ static int send_nfsd_probes(struct rpc_context *rpc, INTERFACE_INFO *InterfaceLi
   return 0;
 }
 
-struct nfs_server_list *nfs_find_local_servers(void)
+struct nfs_server_list *
+nfs_find_local_servers(void)
 {
   struct rpc_context *rpc;
   struct nfs_list_data data = {0, NULL};
@@ -1700,13 +2577,17 @@ struct nfs_server_list *nfs_find_local_servers(void)
 }
 #else
 
-static int send_nfsd_probes(struct rpc_context *rpc, struct ifconf *ifc, struct nfs_list_data *data)
+static int
+send_nfsd_probes(struct rpc_context *rpc, struct ifconf *ifc,
+                 struct nfs_list_data *data)
 {
 	char *ptr;
 
 	assert(rpc->magic == RPC_CONTEXT_MAGIC);
 
-	for (ptr =(char *)(ifc->ifc_buf); ptr < (char *)(ifc->ifc_buf) + ifc->ifc_len; ) {
+	for (ptr =(char *)(ifc->ifc_buf);
+             ptr < (char *)(ifc->ifc_buf) + ifc->ifc_len;
+             ) {
 		struct ifreq ifr;
 		char bcdd[16];
 
@@ -1724,9 +2605,11 @@ static int send_nfsd_probes(struct rpc_context *rpc, struct ifconf *ifc, struct 
 		if (ifr.ifr_addr.sa_family != AF_INET) {
 			continue;
 		}
+#ifndef PS3_PPU
 		if (ioctl(rpc_get_fd(rpc), SIOCGIFFLAGS, &ifr) < 0) {
 			return -1;
 		}
+#endif
 		if (!(ifr.ifr_flags & IFF_UP)) {
 			continue;
 		}
@@ -1736,17 +2619,22 @@ static int send_nfsd_probes(struct rpc_context *rpc, struct ifconf *ifc, struct 
 		if (!(ifr.ifr_flags & IFF_BROADCAST)) {
 			continue;
 		}
+#ifndef PS3_PPU
 		if (ioctl(rpc_get_fd(rpc), SIOCGIFBRDADDR, &ifr) < 0) {
 			continue;
 		}
-		if (getnameinfo(&ifr.ifr_broadaddr, sizeof(struct sockaddr_in), &bcdd[0], sizeof(bcdd), NULL, 0, NI_NUMERICHOST) < 0) {
+#endif
+		if (getnameinfo(&ifr.ifr_broadaddr, sizeof(struct sockaddr_in),
+                                &bcdd[0], sizeof(bcdd), NULL, 0,
+                                NI_NUMERICHOST) < 0) {
 			continue;
 		}
 		if (rpc_set_udp_destination(rpc, bcdd, 111, 1) < 0) {
 			return -1;
 		}
 
-		if (rpc_pmap2_callit_async(rpc, MOUNT_PROGRAM, 2, 0, NULL, 0, callit_cb, data) < 0) {
+		if (rpc_pmap2_callit_async(rpc, MOUNT_PROGRAM, 2, 0, NULL, 0,
+                                           callit_cb, data) < 0) {
 			return -1;
 		}
 	}
@@ -1754,7 +2642,8 @@ static int send_nfsd_probes(struct rpc_context *rpc, struct ifconf *ifc, struct 
 	return 0;
 }
 
-struct nfs_server_list *nfs_find_local_servers(void)
+struct nfs_server_list *
+nfs_find_local_servers(void)
 {
 	struct rpc_context *rpc;
 	struct nfs_list_data data = {0, NULL};
@@ -1786,11 +2675,13 @@ struct nfs_server_list *nfs_find_local_servers(void)
 		ifc.ifc_len = size;
 		ifc.ifc_buf = malloc(size);
 		memset(ifc.ifc_buf, 0, size);
+#ifndef PS3_PPU
 		if (ioctl(rpc_get_fd(rpc), SIOCGIFCONF, (caddr_t)&ifc) < 0) {
 			rpc_destroy_context(rpc);
 			free(ifc.ifc_buf);
 			return NULL;
 		}
+#endif
 	}
 
 	for (loop=0; loop<3; loop++) {
@@ -1836,4 +2727,6 @@ struct nfs_server_list *nfs_find_local_servers(void)
 	}
 	return data.srvrs;
 }
-#endif//WIN32
+#endif /* WIN32 */
+
+#endif /* !defined(NO_SRV_AUTOSCAN) */
