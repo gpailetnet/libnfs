@@ -64,7 +64,7 @@ char* char_buf = NULL;
 #define WRITE_OFFSET 517
 #define NUM_BATCH_WRITES 9
 #define NUM_PWRITES 1024
-#define BYTES_WRITE (1024 * 1024)
+#define BYTES_WRITE (1024 * 1024 * 1024)
 #define WRITE_CHAR 'a'
 
 // Input parameters for parallel reads in batches done in series
@@ -492,6 +492,7 @@ void nfs_write_cb(int status, struct nfs_context *nfs, void *data, void *private
 
 	printf("write successful with %d bytes of data\n", status);
 	printf("Time of write was: %f seconds\n", time_diff);
+	printf("Bandwidth: %f MB/s\n", status/ time_diff / 1000000);
 
 	printf("\n");
 	printf("Fstat file :%s\n", NFSFILE);
@@ -719,7 +720,7 @@ void nfs_stat64_cb(int status, struct nfs_context *nfs, void *data, void *privat
 	printf("\n");
 
 	printf("Open file for reading :%s\n", NFSFILE);
-	if (nfs_open_async(nfs, NFSFILE, O_RDONLY, nfs_open_cb, client) != 0) {
+	if (nfs_open_async(nfs, NFSFILE, O_RDONLY, nfs_open_cb_write, client) != 0) {
 		printf("Failed to start async nfs open\n");
 		exit(10);
 	}
