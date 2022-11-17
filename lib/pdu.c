@@ -43,6 +43,7 @@
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
+#include <sys/uio.h>
 #include "slist.h"
 #include "libnfs-zdr.h"
 #include "libnfs.h"
